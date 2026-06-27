@@ -33,5 +33,12 @@ let package = Package(
             dependencies: ["SpatialEngine"],
             path: "Sources/AtmosDaemon"
         ),
+        // Phase 3: SwiftUI menu-bar control app. Hosts the engine in-process; the
+        // binary is wrapped into atmos-control.app by App/build-app.sh (LSUIElement).
+        .executableTarget(
+            name: "AtmosControlApp",
+            dependencies: ["SpatialEngine"],
+            path: "Sources/AtmosControlApp"
+        ),
     ]
 )

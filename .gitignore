@@ -7,3 +7,4 @@ DerivedData/
 *.swiftmodule
 /tmp/
 scratch/
+dist/
