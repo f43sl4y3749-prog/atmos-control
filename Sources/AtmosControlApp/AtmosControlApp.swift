@@ -18,7 +18,6 @@ struct AtmosControlApp: App {
         MenuBarExtra {
             PanelView()
                 .environmentObject(controller)
-                .frame(width: 332)
         } label: {
             MenuBarGlyph(on: controller.isOn)
         }
@@ -37,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard preview else { return }
 
         // Dev-only: ATMOS_PREVIEW=1 opens the panel in a window for screenshotting.
-        let host = NSHostingController(rootView: PanelView().environmentObject(previewController).frame(width: 332))
+        let host = NSHostingController(rootView: PanelView().environmentObject(previewController))
         host.sizingOptions = [.preferredContentSize]
         let win = NSWindow(contentViewController: host)
         win.title = "atmos-control"

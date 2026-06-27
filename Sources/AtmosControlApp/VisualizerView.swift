@@ -11,9 +11,9 @@ struct VisualizerView: View {
         VStack(spacing: 5) {
             HStack(alignment: .center, spacing: 8) {
                 RadarView()
-                    .frame(width: 162, height: 162)
+                    .frame(width: 150, height: 150)
                 ElevationGauge(elevation: controller.config.elevation)
-                    .frame(width: 22, height: 162)
+                    .frame(width: 22, height: 150)
             }
             Text(readout)
                 .font(.system(size: 10, design: .monospaced))

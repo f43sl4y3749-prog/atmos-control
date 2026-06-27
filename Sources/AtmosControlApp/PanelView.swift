@@ -7,29 +7,39 @@ import SpatialEngine
 
 struct PanelView: View {
     @EnvironmentObject var controller: EngineController
+    @State private var contentHeight: CGFloat = 560
+
+    /// Never let the panel run past the screen edge: cap at the visible frame
+    /// (already excludes menu bar + Dock), leaving a little breathing room.
+    private var maxPanelHeight: CGFloat { (NSScreen.main?.visibleFrame.height ?? 900) - 12 }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            header
-            Divider()
-
-            if !controller.atmosPresent {
-                driverMissing
-            } else {
-                statusStrip
-                visualizerRow
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 11) {
+                header
                 Divider()
-                controls
-            }
 
-            if let err = controller.lastError {
-                Text(err).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-            }
+                if !controller.atmosPresent {
+                    driverMissing
+                } else {
+                    statusStrip
+                    visualizerRow
+                    Divider()
+                    controls
+                }
 
-            Divider()
-            footer
+                if let err = controller.lastError {
+                    Text(err).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider()
+                footer
+            }
+            .padding(14)
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { contentHeight = $0 }
         }
-        .padding(14)
+        .scrollBounceBehavior(.basedOnSize)   // static when it fits, scrolls only when clamped
+        .frame(width: 332, height: min(contentHeight, maxPanelHeight))
         .tint(.instrument)   // unify on the single accent (segmented controls, switch, sliders)
     }
 
@@ -75,7 +85,7 @@ struct PanelView: View {
             VisualizerView()
             MeterView(levelL: controller.meterL, levelR: controller.meterR,
                       holdL: controller.peakHoldL, holdR: controller.peakHoldR)
-                .frame(width: 66, height: 168)
+                .frame(width: 62, height: 150)
         }
         .frame(maxWidth: .infinity, alignment: .center)
     }
