@@ -15,16 +15,23 @@ let package = Package(
             name: "Phase0Spike",
             path: "Sources/Phase0Spike"
         ),
-        // Phase 1: audio passthrough daemon — reads from the atmos-control virtual
-        // loopback device and plays out to a real output device (two HAL units +
-        // lock-free ring buffer bridging the two clock domains).
-        .executableTarget(
-            name: "AtmosDaemon",
-            path: "Sources/AtmosDaemon",
+        // Phase 2/3: shared spatializer engine — capture (atmos-control loopback) →
+        // AUSpatialMixer (stereo AmbienceBed, head-tracked binaural) → real output.
+        // Lock-free SPSC ring bridges the clock domains. Driven by the CLI + the app.
+        .target(
+            name: "SpatialEngine",
+            path: "Sources/SpatialEngine",
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
             ]
+        ),
+        // Thin CLI over SpatialEngine: env-configurable, prints a 1 Hz diagnostic
+        // (captured/played/ringFill/peak + 3116). The Phase-1/2 debug harness.
+        .executableTarget(
+            name: "AtmosDaemon",
+            dependencies: ["SpatialEngine"],
+            path: "Sources/AtmosDaemon"
         ),
     ]
 )
