@@ -19,7 +19,8 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .tint(.instrument)
         .frame(minWidth: 460, idealWidth: 480, minHeight: 420, idealHeight: 620)
-        .onAppear { controller.refreshDevices() }
+        .onAppear { controller.refreshDevices(); controller.surfaceAppeared() }
+        .onDisappear { controller.surfaceDisappeared() }
     }
 
     // MARK: Routing

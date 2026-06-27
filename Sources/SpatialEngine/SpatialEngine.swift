@@ -105,6 +105,9 @@ public final class SpatialEngine: @unchecked Sendable {
 
     private var ctx: Ctx?
     private var outputDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
+    private var cachedOutputName = ""        // device name only changes on start / sink-swap
+    private var pollTick = 0                  // downsample the 3116 HAL read
+    private var cached3116 = false
 
     public init() {}
 
@@ -151,6 +154,8 @@ public final class SpatialEngine: @unchecked Sendable {
         guard let atmosID = findAtmosControlDevice() else { throw SpatialEngineError.atmosDeviceNotFound }
         let outID = try resolveOutput(requested: requested, atmosID: atmosID)
         outputDeviceID = outID
+        cachedOutputName = deviceName(outID)
+        pollTick = 0; cached3116 = false
         selog("Capture device : [\(atmosID)] \(deviceName(atmosID))")
         selog("Playback device: [\(outID)] \(deviceName(outID))")
 
@@ -266,18 +271,23 @@ public final class SpatialEngine: @unchecked Sendable {
         var s = EngineState()
         s.running = isRunning
         guard isRunning, let ctx else { return s }
-        s.outputDeviceName = deviceName(outputDeviceID)
+        s.outputDeviceName = cachedOutputName            // cached: no per-tick CFString HAL fetch
         s.peakL = ctx.capturePeakL; ctx.capturePeakL = 0
         s.peakR = ctx.capturePeakR; ctx.capturePeakR = 0
         s.ringFill = ctx.ring.fill()
         s.totalCaptured = ctx.totalCaptured
         s.totalPlayed = ctx.totalPlayed
+        // 3116 only changes on reconfigure/device-change — read it ~1 Hz, not every tick.
         if let mixer = ctx.spatialMixer {
-            var v: UInt32 = 0; var sz = UInt32(MemoryLayout<UInt32>.size)
-            if AudioUnitGetProperty(mixer, kPropAnyInputUsingPersonalizedHRTF, kAudioUnitScope_Global, 0, &v, &sz) == noErr {
-                s.personalizedHRTFEngaged = (v != 0)
+            if pollTick % 15 == 0 {
+                var v: UInt32 = 0; var sz = UInt32(MemoryLayout<UInt32>.size)
+                if AudioUnitGetProperty(mixer, kPropAnyInputUsingPersonalizedHRTF, kAudioUnitScope_Global, 0, &v, &sz) == noErr {
+                    cached3116 = (v != 0)
+                }
             }
+            s.personalizedHRTFEngaged = cached3116
         }
+        pollTick &+= 1
         return s
     }
 

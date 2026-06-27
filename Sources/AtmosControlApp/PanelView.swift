@@ -28,6 +28,8 @@ struct PanelView: View {
         .scrollBounceBehavior(.basedOnSize)   // static when it fits, scrolls only when clamped
         .frame(width: 332, height: panelHeight)
         .tint(.instrument)   // unify on the single accent (segmented controls, switch, sliders)
+        .onAppear { controller.surfaceAppeared() }
+        .onDisappear { controller.surfaceDisappeared() }
     }
 
     // The panel body — rendered live in the ScrollView, and again (hidden) by `heightProbe`.

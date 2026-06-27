@@ -36,6 +36,7 @@ final class EngineController: ObservableObject {
     private var savedDefault: AudioDeviceID?
     private var activeSinkID: AudioDeviceID?   // the real device the graph is rendering to
     private var handlingChange = false
+    private var visibleSurfaces = 0            // open windows observing live state
 
     init() {
         atmosPresent = engine.atmosControlPresent()
@@ -122,18 +123,33 @@ final class EngineController: ObservableObject {
             activeSinkID = fallback.id
             outputName = fallback.name
             lastError = "Output changed — now routing to \(fallback.name)."
-            syncMotion()
+            updateActivity()
         } catch {
             lastError = "Output device lost — \(error)"
             powerOff()
         }
     }
 
+    // MARK: Surface visibility
+
+    /// Poll meters + run head-motion only while a window is actually on screen — the
+    /// engine keeps spatializing when closed, but nobody's looking at the live readouts.
+    /// (Counted because the panel and settings window can be open independently.)
+    func surfaceAppeared()   { visibleSurfaces += 1; updateActivity() }
+    func surfaceDisappeared() { visibleSurfaces = max(0, visibleSurfaces - 1); updateActivity() }
+    private var panelVisible: Bool { visibleSurfaces > 0 }
+
+    private func updateActivity() {
+        if isOn && panelVisible { startPolling() } else { stopPolling() }
+        syncMotion()
+    }
+
     // MARK: Head-pose motion
 
-    /// Run head-pose updates only while the engine is on and head tracking is enabled.
+    /// Run head-pose updates only while on, head-tracking enabled, AND a surface visible.
+    /// (Real audio head-tracking is AUSpatialMixer property 3111 — independent of this.)
     private func syncMotion() {
-        if isOn && config.headTracking && motion.isAvailable {
+        if isOn && config.headTracking && panelVisible && motion.isAvailable {
             motion.start()
         } else {
             motion.stop()
@@ -182,8 +198,7 @@ final class EngineController: ObservableObject {
             activeSinkID = real?.id ?? (current.id != atmos ? current.id : nil)
             isOn = true
             lastError = nil
-            startPolling()
-            syncMotion()
+            updateActivity()
         } catch {
             lastError = "\(error)"
             restoreSafeDefault()   // never leave the system default on the virtual sink
@@ -191,14 +206,13 @@ final class EngineController: ObservableObject {
     }
 
     func powerOff() {
-        stopPolling()
         engine.stop()
         restoreSafeDefault()
         isOn = false
         activeSinkID = nil
         state = EngineState()
         meterL = 0; meterR = 0; peakHoldL = 0; peakHoldR = 0
-        syncMotion()
+        updateActivity()
     }
 
     /// Restore the system default to a present, real (non-virtual) device. Prefers the
@@ -222,7 +236,7 @@ final class EngineController: ObservableObject {
     /// head tracking). Brief audio gap while running.
     func applyConfig() {
         guard isOn else { engine.config = config; return }
-        do { try engine.reconfigure(config); syncMotion() }
+        do { try engine.reconfigure(config); updateActivity() }
         catch { lastError = "\(error)"; powerOff() }
     }
 
@@ -238,10 +252,11 @@ final class EngineController: ObservableObject {
     // MARK: Polling
 
     private func startPolling() {
-        timer?.invalidate()
-        let t = Timer(timeInterval: 1.0 / 24.0, repeats: true) { [weak self] _ in
+        guard timer == nil else { return }   // idempotent: don't restart on every activity change
+        let t = Timer(timeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        t.tolerance = 1.0 / 30.0   // let the OS coalesce wake-ups
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
@@ -251,7 +266,8 @@ final class EngineController: ObservableObject {
     private func tick() {
         let s = engine.pollState()
         state = s
-        outputName = s.outputDeviceName.isEmpty ? outputName : s.outputDeviceName
+        let nm = s.outputDeviceName
+        if !nm.isEmpty && nm != outputName { outputName = nm }   // guard: avoid no-op publishes
         // Meter: fast attack to the new peak, gentle release; hold the peak marker.
         let releaseL = meterL * 0.82, releaseR = meterR * 0.82
         meterL = max(s.peakL, releaseL)
