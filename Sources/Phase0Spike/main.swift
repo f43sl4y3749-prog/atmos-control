@@ -3,14 +3,17 @@
 // Phase 0 de-risk spike — AUSpatialMixer personalised + head-tracked binaural.
 //
 // Instantiates AUSpatialMixer, sets every relevant property (personalized HRTF,
-// head tracking, output type = headphones), plays a test signal to the default
-// output device, and polls property 3116 every second to report whether
-// personalized HRTF actually engaged.
+// head tracking, output type), plays a test signal to the default output device,
+// and polls property 3116 every second to report whether personalized HRTF
+// actually engaged.
 //
 // Build:   swift build
 // Run:     .build/debug/Phase0Spike [optional-audio-file.wav]
-// Env:     SECONDS=N   override run duration (default 25 s)
-//          SWEEP=1     sweep azimuth from -90° to +90° across the run
+// Env:     SECONDS=N          override run duration (default 25 s)
+//          SWEEP=1            sweep azimuth from -90° to +90° across the run
+//          OUTPUT_TYPE=...    headphones (default) | builtin | external
+//          HRTF_MODE=...      auto (default) | on | off
+//          ALGO=...           useoutputtype (default) | hrtf | hrtfhq
 //
 // Swift 6 strict-concurrency notes
 // ---------------------------------
@@ -50,10 +53,16 @@ let kPropAnyInputUsingPersonalizedHRTF: AudioUnitPropertyID = 3116
 //   READ-ONLY, UInt32 0/1.  This is the primary signal we are testing.
 
 // Enum values
+let kSpatAlgHRTF:           UInt32 = 2   // kSpatializationAlgorithm_HRTF
+let kSpatAlgHRTFHQ:         UInt32 = 6   // kSpatializationAlgorithm_HRTFHQ
 let kSpatAlgUseOutputType:  UInt32 = 7   // kSpatializationAlgorithm_UseOutputType
 let kSrcModePointSource:    UInt32 = 2   // kSpatialMixerSourceMode_PointSource
 let kOutputTypeHeadphones:  UInt32 = 1   // kSpatialMixerOutputType_Headphones
+let kOutputTypeBuiltIn:     UInt32 = 2   // kSpatialMixerOutputType_BuiltInSpeakers
+let kOutputTypeExternal:    UInt32 = 3   // kSpatialMixerOutputType_ExternalSpeakers
+let kPersonalizedHRTFOff:   UInt32 = 0   // kSpatialMixerPersonalizedHRTFMode_Off
 let kPersonalizedHRTFOn:    UInt32 = 1   // kSpatialMixerPersonalizedHRTFMode_On
+let kPersonalizedHRTFAuto:  UInt32 = 2   // kSpatialMixerPersonalizedHRTFMode_Auto
 
 // Spatial mixer parameter IDs (raw values — symbolic names may not be in overlay)
 let kParamAzimuth:   AudioUnitParameterID = 0   // kSpatialMixerParam_Azimuth   ±180°
@@ -272,6 +281,49 @@ let runSeconds: Int = {
 }()
 let doSweep = (ProcessInfo.processInfo.environment["SWEEP"] == "1")
 
+// OUTPUT_TYPE: which output device class the AU should render for.
+let (cfgOutputType, cfgOutputTypeName): (UInt32, String) = {
+    let raw = (ProcessInfo.processInfo.environment["OUTPUT_TYPE"] ?? "headphones")
+        .lowercased().trimmingCharacters(in: .whitespaces)
+    switch raw {
+    case "headphones": return (kOutputTypeHeadphones, "Headphones")
+    case "builtin":    return (kOutputTypeBuiltIn,    "BuiltInSpeakers")
+    case "external":   return (kOutputTypeExternal,   "ExternalSpeakers")
+    default:
+        print("WARNING: Unrecognized OUTPUT_TYPE='\(raw)' — using 'headphones'")
+        return (kOutputTypeHeadphones, "Headphones")
+    }
+}()
+
+// HRTF_MODE: whether to request personalized, generic, or auto HRTF.
+// Default is "auto" (graceful fallback: uses personal profile when available).
+let (cfgHRTFMode, cfgHRTFModeName): (UInt32, String) = {
+    let raw = (ProcessInfo.processInfo.environment["HRTF_MODE"] ?? "auto")
+        .lowercased().trimmingCharacters(in: .whitespaces)
+    switch raw {
+    case "auto": return (kPersonalizedHRTFAuto, "Auto")
+    case "on":   return (kPersonalizedHRTFOn,   "On")
+    case "off":  return (kPersonalizedHRTFOff,  "Off")
+    default:
+        print("WARNING: Unrecognized HRTF_MODE='\(raw)' — using 'auto'")
+        return (kPersonalizedHRTFAuto, "Auto")
+    }
+}()
+
+// ALGO: spatialization algorithm override.
+let (cfgAlgo, cfgAlgoName): (UInt32, String) = {
+    let raw = (ProcessInfo.processInfo.environment["ALGO"] ?? "useoutputtype")
+        .lowercased().trimmingCharacters(in: .whitespaces)
+    switch raw {
+    case "useoutputtype": return (kSpatAlgUseOutputType, "UseOutputType")
+    case "hrtf":          return (kSpatAlgHRTF,          "HRTF")
+    case "hrtfhq":        return (kSpatAlgHRTFHQ,        "HRTFHQ")
+    default:
+        print("WARNING: Unrecognized ALGO='\(raw)' — using 'useoutputtype'")
+        return (kSpatAlgUseOutputType, "UseOutputType")
+    }
+}()
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Context header
 // ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +340,7 @@ if devName.localizedCaseInsensitiveContains("airpods") {
     print("         WARNING: Not AirPods — property 3116 may remain NO")
 }
 print("Dur    : \(runSeconds) s    Sweep: \(doSweep ? "YES (-90 -> +90 deg)" : "NO (fixed front 0 deg)")")
+print("Config : OutputType=\(cfgOutputTypeName)(\(cfgOutputType))  HRTFMode=\(cfgHRTFModeName)(\(cfgHRTFMode))  Algo=\(cfgAlgoName)(\(cfgAlgo))")
 print()
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -481,16 +534,16 @@ var ok_outType    = false
 var ok_headTrack  = false
 var ok_hrtfMode   = false
 
-// 1. SpatializationAlgorithm = UseOutputType (7)
-//    Makes the AU pick the rendering algorithm based on kPropOutputType.
-//    Scope: Input, element 0
-var spatAlgVal = kSpatAlgUseOutputType
+// 1. SpatializationAlgorithm  (Input/0)
+//    Makes the AU pick the rendering algorithm based on kPropOutputType when
+//    UseOutputType (7) is selected; can also be forced to HRTF (2) or HRTFHQ (6).
+var spatAlgVal = cfgAlgo
 let s_spatAlg = AudioUnitSetProperty(au,
     kAudioUnitProperty_SpatializationAlgorithm,
     kAudioUnitScope_Input, 0,
     &spatAlgVal, UInt32(MemoryLayout<UInt32>.size))
 ok_spatAlg = (s_spatAlg == noErr)
-print("  set SpatializationAlgorithm=UseOutputType(7) [Input/0] -> \(fmtStatus(s_spatAlg))")
+print("  set SpatializationAlgorithm=\(cfgAlgoName)(\(cfgAlgo)) [Input/0] -> \(fmtStatus(s_spatAlg))")
 if let v = getPropU32(au: au, prop: kAudioUnitProperty_SpatializationAlgorithm,
                       scope: kAudioUnitScope_Input, element: 0) {
     print("  get SpatializationAlgorithm -> \(v)")
@@ -504,16 +557,15 @@ ok_srcMode = setPropU32(au: au, prop: kPropSourceMode,
                         value: kSrcModePointSource,
                         label: "SourceMode=PointSource(2) [3005/Input/0]")
 
-// 3. OutputType = Headphones (1)
-//    Documented scope is Global; some builds may require Input.  Try both.
-print("  trying OutputType=Headphones(1) on Global scope…")
-var outTypeVal = kOutputTypeHeadphones
+// 3. OutputType  (Global scope preferred; some builds require Input)
+print("  trying OutputType=\(cfgOutputTypeName)(\(cfgOutputType)) on Global scope…")
+var outTypeVal = cfgOutputType
 let s_outGlobal = AudioUnitSetProperty(au, kPropOutputType,
     kAudioUnitScope_Global, 0,
     &outTypeVal, UInt32(MemoryLayout<UInt32>.size))
 print("    set OutputType/Global -> \(fmtStatus(s_outGlobal))")
 if s_outGlobal != noErr {
-    print("  Global failed — retrying OutputType=Headphones(1) on Input scope…")
+    print("  Global failed — retrying OutputType=\(cfgOutputTypeName)(\(cfgOutputType)) on Input scope…")
     let s_outInput = AudioUnitSetProperty(au, kPropOutputType,
         kAudioUnitScope_Input, 0,
         &outTypeVal, UInt32(MemoryLayout<UInt32>.size))
@@ -525,10 +577,10 @@ if s_outGlobal != noErr {
 // Read back from whichever scope has the value
 if let v = getPropU32(au: au, prop: kPropOutputType,
                       scope: kAudioUnitScope_Global, element: 0) {
-    print("  get OutputType/Global -> \(v)  (1=Headphones)")
+    print("  get OutputType/Global -> \(v)  (1=Headphones 2=BuiltInSpeakers 3=ExternalSpeakers)")
 } else if let v = getPropU32(au: au, prop: kPropOutputType,
                               scope: kAudioUnitScope_Input, element: 0) {
-    print("  get OutputType/Input  -> \(v)  (1=Headphones)")
+    print("  get OutputType/Input  -> \(v)  (1=Headphones 2=BuiltInSpeakers 3=ExternalSpeakers)")
 } else {
     print("  get OutputType -> unreadable from both Global and Input scopes")
 }
@@ -541,14 +593,13 @@ ok_headTrack = setPropU32(au: au, prop: kPropEnableHeadTracking,
                           value: 1,
                           label: "EnableHeadTracking=1 [3111/Global]")
 
-// 5. PersonalizedHRTFMode = On (1)  (macOS 13+)
-//    Instructs the AU to use the user's scanned ear profile if available.
-//    Falls back to generic HRTF if the profile is absent or the entitlement
-//    (spatial-audio.profile-access) is not granted.
+// 5. PersonalizedHRTFMode  (macOS 13+, Global scope)
+//    Off(0): always generic HRTF; On(1): require personal profile; Auto(2): use
+//    profile when available, otherwise fall back to generic (product default).
 ok_hrtfMode = setPropU32(au: au, prop: kPropPersonalizedHRTFMode,
                          scope: kAudioUnitScope_Global, element: 0,
-                         value: kPersonalizedHRTFOn,
-                         label: "PersonalizedHRTFMode=On(1) [3113/Global]")
+                         value: cfgHRTFMode,
+                         label: "PersonalizedHRTFMode=\(cfgHRTFModeName)(\(cfgHRTFMode)) [3113/Global]")
 print()
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -746,16 +797,16 @@ print("════════════════════════�
 print("SUMMARY")
 print()
 print("─── Property Set results ───────────────────────────────────────────────")
-print("  SpatializationAlgorithm=UseOutputType(7) [Input/0]  : \(ok_spatAlg   ? "OK" : "FAILED")")
+print("  SpatializationAlgorithm=\(cfgAlgoName)(\(cfgAlgo)) [Input/0]  : \(ok_spatAlg   ? "OK" : "FAILED")")
 print("  SourceMode=PointSource(2)       [3005/Input/0]      : \(ok_srcMode   ? "OK" : "FAILED")")
-print("  OutputType=Headphones(1)        [3100]              : \(ok_outType   ? "OK" : "FAILED")")
+print("  OutputType=\(cfgOutputTypeName)(\(cfgOutputType))        [3100]              : \(ok_outType   ? "OK" : "FAILED")")
 print("  EnableHeadTracking=1            [3111/Global]       : \(ok_headTrack ? "OK" : "FAILED")")
-print("  PersonalizedHRTFMode=On(1)      [3113/Global]       : \(ok_hrtfMode  ? "OK" : "FAILED")")
+print("  PersonalizedHRTFMode=\(cfgHRTFModeName)(\(cfgHRTFMode))      [3113/Global]       : \(ok_hrtfMode  ? "OK" : "FAILED")")
 print()
 print("─── Final property read-backs ──────────────────────────────────────────")
-let outTypeStr      = finalOutType.map { "\($0) (1=Headphones)" }     ?? "<unreadable>"
-let headTrackStr    = finalHeadTrack.map { "\($0)" }                  ?? "<unreadable>"
-let hrtfModeStr     = finalHRTFMode.map { "\($0) (0=Off 1=On 2=Auto)" } ?? "<unreadable>"
+let outTypeStr   = finalOutType.map { "\($0) (1=Headphones 2=BuiltInSpeakers 3=ExternalSpeakers)" } ?? "<unreadable>"
+let headTrackStr = finalHeadTrack.map { "\($0)" }                              ?? "<unreadable>"
+let hrtfModeStr  = finalHRTFMode.map { "\($0) (0=Off 1=On 2=Auto)" }          ?? "<unreadable>"
 print("  OutputType         (3100) : \(outTypeStr)")
 print("  EnableHeadTracking (3111) : \(headTrackStr)")
 print("  PersonalizedHRTFMode(3113): \(hrtfModeStr)")
@@ -763,17 +814,23 @@ print()
 print("─── Key signal ─────────────────────────────────────────────────────────")
 print("  AnyInputUsingPersonalizedHRTF (3116) ever YES: \(everEngaged ? "YES" : "NO")")
 print()
-if everEngaged {
-    print("VERDICT: personalized HRTF ENGAGED")
+if cfgOutputType != kOutputTypeHeadphones {
+    // Speaker-virtualization path: 3116 is always NO — that is correct behaviour.
+    print("VERDICT: speaker-virtualization path (OutputType=\(cfgOutputTypeName)).")
+    print("         Personalized HRTF (3116) is headphones-only; reading NO here is expected.")
 } else {
-    print("VERDICT: personalized HRTF DID NOT engage")
-    print("         Possible reasons:")
-    print("           - No personalized Spatial Audio profile scanned in Settings")
-    print("           - Missing com.apple.developer.coremotion.head-pose entitlement")
-    print("           - Missing spatial-audio.profile-access entitlement (private)")
-    print("           - Output device is not AirPods / supported headphone")
-    print("           - Generic HRTF fallback — binaural rendering still active,")
-    print("             just not personalized")
+    // Headphones path — interpret 3116 relative to the requested HRTF mode.
+    if cfgHRTFMode == kPersonalizedHRTFOff {
+        print("VERDICT: GENERIC HRTF (personalization forced OFF) — binaural rendering active")
+        print("         by design. 3116=NO is correct.")
+    } else if everEngaged {
+        print("VERDICT: PERSONALIZED HRTF ENGAGED (premium tier).")
+    } else {
+        print("VERDICT: GENERIC HRTF FALLBACK — personalization requested (\(cfgHRTFModeName))")
+        print("         but not engaged. Binaural still active (core tier works).")
+        print("         Likely cause: not AirPods, OR no scanned profile, OR missing")
+        print("         spatial-audio.profile-access entitlement.")
+    }
 }
 print()
 print("─── Listener reminder ──────────────────────────────────────────────────")
