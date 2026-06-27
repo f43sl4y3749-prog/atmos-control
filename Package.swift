@@ -40,5 +40,17 @@ let package = Package(
             dependencies: ["SpatialEngine"],
             path: "Sources/AtmosControlApp"
         ),
+        // Phase 4 spike: prove personalized HRTF (3116) engages while capturing the
+        // system mix via a MUTING process tap, WITHOUT hijacking the default output
+        // (AirPods stay default). Validates the premium-tier unlock path.
+        .executableTarget(
+            name: "TapSpike",
+            dependencies: ["SpatialEngine"],
+            path: "Sources/TapSpike",
+            linkerSettings: [
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("AudioToolbox"),
+            ]
+        ),
     ]
 )

@@ -147,16 +147,25 @@ public final class SpatialEngine: @unchecked Sendable {
 
     /// Build + start the graph. `outputDeviceID` is the *real* sink (e.g. AirPods);
     /// nil resolves the current default output (when it isn't atmos-control).
-    public func start(outputDeviceID requested: AudioDeviceID? = nil) throws {
+    /// Build + start the graph. `outputDeviceID` is the real sink (nil = current default).
+    /// `captureDeviceID` overrides the capture source (nil = the atmos-control loopback);
+    /// the process-tap path passes a tap aggregate here to keep AirPods the default.
+    public func start(outputDeviceID requested: AudioDeviceID? = nil, captureDeviceID: AudioDeviceID? = nil) throws {
         guard !isRunning else { return }
         seLog = logger
 
-        guard let atmosID = findAtmosControlDevice() else { throw SpatialEngineError.atmosDeviceNotFound }
-        let outID = try resolveOutput(requested: requested, atmosID: atmosID)
+        let captureID: AudioDeviceID
+        if let c = captureDeviceID, c != AudioDeviceID(kAudioObjectUnknown) {
+            captureID = c
+        } else {
+            guard let atmosID = findAtmosControlDevice() else { throw SpatialEngineError.atmosDeviceNotFound }
+            captureID = atmosID
+        }
+        let outID = try resolveOutput(requested: requested, atmosID: captureID)
         outputDeviceID = outID
         cachedOutputName = deviceName(outID)
         pollTick = 0; cached3116 = false
-        selog("Capture device : [\(atmosID)] \(deviceName(atmosID))")
+        selog("Capture device : [\(captureID)] \(deviceName(captureID))")
         selog("Playback device: [\(outID)] \(deviceName(outID))")
 
         let ctx = Ctx()
@@ -168,7 +177,7 @@ public final class SpatialEngine: @unchecked Sendable {
         ctx.captureUnit = captureUnit
         setEnableIO(captureUnit, enable: 0, scope: kAudioUnitScope_Output, element: 0, label: "capture")
         setEnableIO(captureUnit, enable: 1, scope: kAudioUnitScope_Input, element: 1, label: "capture")
-        setCurrentDevice(captureUnit, deviceID: atmosID, label: "capture")
+        setCurrentDevice(captureUnit, deviceID: captureID, label: "capture")
         var capFmt = stereoFloat32Format()
         setStreamFormat(captureUnit, fmt: &capFmt, scope: kAudioUnitScope_Output, element: 1, label: "capture")
         var maxFrames: UInt32 = 4096; var mfSize = UInt32(MemoryLayout<UInt32>.size)
@@ -289,6 +298,16 @@ public final class SpatialEngine: @unchecked Sendable {
         }
         pollTick &+= 1
         return s
+    }
+
+    /// Read property 3116 fresh (un-downsampled) — for the process-tap spike's 1 Hz loop.
+    public func readPersonalizedHRTFEngaged() -> Bool {
+        guard isRunning, let mixer = ctx?.spatialMixer else { return false }
+        var v: UInt32 = 0; var sz = UInt32(MemoryLayout<UInt32>.size)
+        if AudioUnitGetProperty(mixer, kPropAnyInputUsingPersonalizedHRTF, kAudioUnitScope_Global, 0, &v, &sz) == noErr {
+            return v != 0
+        }
+        return false
     }
 
     /// Live-update the source position/gain (safe while running; AudioUnitSetParameter).
