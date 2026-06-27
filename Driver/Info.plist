@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.atmos-control.driver</string>
+
+    <key>CFBundleExecutable</key>
+    <string>atmos-control</string>
+
+    <key>CFBundleName</key>
+    <string>atmos-control</string>
+
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <!--
+        CFPlugInFactories:
+            Factory UUID → exported C function name.
+            This UUID is referenced in CFPlugInTypes below.
+    -->
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>2D2A46EE-1E5D-4E99-A721-B8BB6530F0B4</key>
+        <string>AtmosDriver_Create</string>
+    </dict>
+
+    <!--
+        CFPlugInTypes:
+            AudioServerPlugIn type UUID → array of factory UUIDs that can satisfy it.
+            kAudioServerPlugInTypeUUID = 443ABAB8-E7B3-491A-B985-BEB9187030DB
+    -->
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+        <array>
+            <string>2D2A46EE-1E5D-4E99-A721-B8BB6530F0B4</string>
+        </array>
+    </dict>
+</dict>
+</plist>
