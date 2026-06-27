@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
+  <title>atmos-control menu-bar glyph — engine on</title>
+  <desc>Binaural mark: a filled listener head between two pairs of soundstage arcs (active state, tinted accent by the app).</desc>
+  <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+    <path d="M15.43 5.33 A7.2 7.2 0 0 1 15.43 16.67"/>
+    <path d="M13.96 7.22 A4.8 4.8 0 0 1 13.96 14.78"/>
+    <path d="M6.57 5.33 A7.2 7.2 0 0 0 6.57 16.67"/>
+    <path d="M8.04 7.22 A4.8 4.8 0 0 0 8.04 14.78"/>
+  </g>
+  <circle cx="11" cy="11" r="2.7" fill="currentColor"/>
+</svg>

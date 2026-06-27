@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 92 206" width="92" height="206" font-family="ui-monospace, 'SF Mono', monospace">
+  <title>Stereo peak-meter scaffold — L/R</title>
+  <desc>Static frame and dB scale for twin vertical peak meters. Bar fills and peak-hold are drawn dynamically.</desc>
+
+  <!-- dB scale ticks + labels (left) -->
+  <g stroke="#6E6E73" stroke-opacity="0.5" stroke-linecap="round">
+    <line x1="34" y1="12"  x2="40" y2="12"/>
+    <line x1="34" y1="29.6" x2="40" y2="29.6"/>
+    <line x1="34" y1="47.2" x2="40" y2="47.2"/>
+    <line x1="34" y1="82.4" x2="40" y2="82.4"/>
+    <line x1="34" y1="152.8" x2="40" y2="152.8"/>
+    <line x1="34" y1="188" x2="40" y2="188"/>
+  </g>
+  <g fill="#6E6E73" font-size="8" text-anchor="end">
+    <text x="31" y="15">0</text>
+    <text x="31" y="32.6">−6</text>
+    <text x="31" y="50.2">−12</text>
+    <text x="31" y="85.4">−24</text>
+    <text x="31" y="155.8">−48</text>
+    <text x="31" y="191">−60</text>
+  </g>
+
+  <!-- clip line at 0 dB -->
+  <line x1="42" y1="12" x2="86" y2="12" stroke="#E0533A" stroke-opacity="0.6" stroke-width="1"/>
+
+  <!-- bar frames -->
+  <g fill="none" stroke="#6E6E73" stroke-opacity="0.8">
+    <rect x="44" y="12" width="16" height="176" rx="2"/>
+    <rect x="68" y="12" width="16" height="176" rx="2"/>
+  </g>
+
+  <!-- channel labels -->
+  <g fill="#8E8E93" font-size="9" text-anchor="middle">
+    <text x="52" y="201">L</text>
+    <text x="76" y="201">R</text>
+  </g>
+</svg>
