@@ -201,6 +201,10 @@ all system audio.
 **Phase 3 — Full settings UI + Dolby-style controls.** SwiftUI menu-bar app exposing the entire
 parameter/property surface + our own downmix/trim/monitoring-layout/binaural-distance/metering +
 presets. **Proves:** the "full settings" promise within legal bounds.
+- **UI / visual work MUST use the `/impeccable` skill** (UI/UX design, visual hierarchy, layout,
+  typography, motion, control surfaces) and **`/svg`** (icons, the spatial-position/azimuth-elevation
+  visualizer, meters, vector assets, menu-bar glyph). Invoke them when designing/refining any visual
+  element — don't hand-roll the design.
 
 **Phase 4 — Hardening & future.** Latency tuning, device/AirPods hot-swap, head-tracking recenter.
 Spike `AUAudioMix` (macOS 26) as a future renderer. Optionally add the ADM BWF file player.
