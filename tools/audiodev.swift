@@ -82,14 +82,32 @@ case "list":
 case "get-output":
     let id = currentDefaultOutput()
     print("\(id)\t\(deviceName(id))")
-case "set-output":
-    guard args.count > 2 else { FileHandle.standardError.write("usage: set-output <substr>\n".data(using:.utf8)!); exit(2) }
+case "get-both":
+    // Show BOTH the main (app-audio) and system (alert-sound) default outputs.
+    var sysId = AudioDeviceID(0); var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    _ = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &sz, &sysId)
+    let mainId = currentDefaultOutput()
+    print("main   \(mainId)\t\(deviceName(mainId))")
+    print("system \(sysId)\t\(deviceName(sysId))")
+case "set-output", "set-main", "set-system":
+    guard args.count > 2 else { FileHandle.standardError.write("usage: \(cmd) <substr>\n".data(using:.utf8)!); exit(2) }
     let needle = args[2].lowercased()
     let match = allDevices().first { outputChannelCount($0) > 0 && deviceName($0).lowercased().contains(needle) }
     guard let dev = match else { FileHandle.standardError.write("no output device matching '\(needle)'\n".data(using:.utf8)!); exit(1) }
-    let s1 = setDefaultOutput(dev, system: false)
-    let s2 = setDefaultOutput(dev, system: true)
-    print("set default output -> \(dev) \(deviceName(dev))  (status main=\(s1) system=\(s2))")
+    switch cmd {
+    case "set-main":
+        let s = setDefaultOutput(dev, system: false)
+        print("set MAIN default output -> \(dev) \(deviceName(dev))  (status=\(s))")
+    case "set-system":
+        let s = setDefaultOutput(dev, system: true)
+        print("set SYSTEM default output -> \(dev) \(deviceName(dev))  (status=\(s))")
+    default:
+        let s1 = setDefaultOutput(dev, system: false)
+        let s2 = setDefaultOutput(dev, system: true)
+        print("set default output (both) -> \(dev) \(deviceName(dev))  (status main=\(s1) system=\(s2))")
+    }
 default:
-    FileHandle.standardError.write("commands: list | get-output | set-output <substr>\n".data(using:.utf8)!); exit(2)
+    FileHandle.standardError.write("commands: list | get-output | get-both | set-output <substr> | set-main <substr> | set-system <substr>\n".data(using:.utf8)!); exit(2)
 }
