@@ -14,6 +14,17 @@ let package = Package(
         .executableTarget(
             name: "Phase0Spike",
             path: "Sources/Phase0Spike"
-        )
+        ),
+        // Phase 1: audio passthrough daemon — reads from the atmos-control virtual
+        // loopback device and plays out to a real output device (two HAL units +
+        // lock-free ring buffer bridging the two clock domains).
+        .executableTarget(
+            name: "AtmosDaemon",
+            path: "Sources/AtmosDaemon",
+            linkerSettings: [
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("AudioToolbox"),
+            ]
+        ),
     ]
 )
