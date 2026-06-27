@@ -291,21 +291,95 @@ print("Dur    : \(runSeconds) s    Sweep: \(doSweep ? "YES (-90 -> +90 deg)" : "
 print()
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - AVAudioEngine + player node
-// ─────────────────────────────────────────────────────────────────────────────
-
-let engine = AVAudioEngine()
-let player = AVAudioPlayerNode()
-engine.attach(player)
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Instantiate AUSpatialMixer
+// MARK: - Raw AudioUnit render graph (no AVAudioEngine) — Approach D
 //
-// AVAudioUnit.instantiate is async (callback on arbitrary queue).
-// We protect the result with a DispatchSemaphore: write in callback, read after wait().
+// Mirrors the eventual daemon render path with raw AudioUnits, pulling audio via
+// render callbacks instead of AVAudioEngine connections:
+//
+//   noise buffer --(input render CB)--> AUSpatialMixer --(output render CB /
+//   AudioUnitRender)--> DefaultOutput unit --> default output device.
+//
+// AVAudioEngine.connect() null-derefs inside DidConnectToMixer when wiring into a
+// freshly-instantiated AUSpatialMixer (the documented crash). The raw-AU graph
+// avoids that AVFAudio code path entirely.
 // ─────────────────────────────────────────────────────────────────────────────
 
-print("Instantiating AUSpatialMixer…")
+/// Shared context handed to the C render callbacks via inRefCon.
+/// Touched only on the single HAL render thread once rendering starts, so
+/// @unchecked Sendable is safe here.
+///
+/// NOTE: samples are held as a RAW heap buffer, NOT a Swift `[Float]`. In Swift 6
+/// main.swift top-level code is @MainActor by default, so an inner closure such
+/// as the one `Array.withUnsafeBufferPointer` requires inherits @MainActor
+/// isolation. Calling it from the real-time audio thread trips
+/// `_swift_task_checkIsolatedSwift` / `dispatch_assert_queue` and aborts. Raw
+/// pointer indexing inside the @convention(c) callback avoids any isolated
+/// closure entirely.
+final class RenderCtx: @unchecked Sendable {
+    var samples: UnsafeMutablePointer<Float>? = nil  // looping mono source
+    var count: Int = 0                               // sample count
+    var pos: Int = 0                                 // read position (render thread)
+    var spatialMixer: AudioUnit? = nil
+}
+let gRenderCtx = RenderCtx()
+
+/// Input render callback: feeds the AUSpatialMixer's mono input bus 0 by copying
+/// from the looping sample buffer. (kAudioUnitProperty_SetRenderCallback / Input)
+let inputRenderProc: AURenderCallback = { inRefCon, _, _, _, inNumberFrames, ioData in
+    guard let ioData = ioData else { return noErr }
+    let ctx = Unmanaged<RenderCtx>.fromOpaque(inRefCon).takeUnretainedValue()
+    let abl = UnsafeMutableAudioBufferListPointer(ioData)
+    let n = Int(inNumberFrames)
+    guard let samples = ctx.samples, ctx.count > 0 else {
+        for b in 0..<abl.count {
+            if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }
+        }
+        return noErr
+    }
+    let count = ctx.count
+    for b in 0..<abl.count {
+        guard let raw = abl[b].mData else { continue }
+        let out = raw.assumingMemoryBound(to: Float.self)
+        var p = ctx.pos
+        for i in 0..<n {
+            out[i] = samples[p]
+            p += 1
+            if p >= count { p = 0 }
+        }
+    }
+    ctx.pos = (ctx.pos + n) % count
+    return noErr
+}
+
+/// Output unit render callback: pulls a stereo buffer from the AUSpatialMixer.
+let outputRenderProc: AURenderCallback = { inRefCon, ioActionFlags, inTimeStamp, _, inNumberFrames, ioData in
+    guard let ioData = ioData else { return noErr }
+    let ctx = Unmanaged<RenderCtx>.fromOpaque(inRefCon).takeUnretainedValue()
+    guard let mixer = ctx.spatialMixer else {
+        let abl = UnsafeMutableAudioBufferListPointer(ioData)
+        for b in 0..<abl.count {
+            if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }
+        }
+        return noErr
+    }
+    return AudioUnitRender(mixer, ioActionFlags, inTimeStamp, 0, inNumberFrames, ioData)
+}
+
+/// Builds a deinterleaved float32 ASBD.
+func makeFloatASBD(channels: UInt32, sampleRate: Double = 48_000) -> AudioStreamBasicDescription {
+    var asbd = AudioStreamBasicDescription()
+    asbd.mSampleRate       = sampleRate
+    asbd.mFormatID         = kAudioFormatLinearPCM
+    asbd.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved
+    asbd.mFramesPerPacket  = 1
+    asbd.mBytesPerFrame    = 4
+    asbd.mBytesPerPacket   = 4
+    asbd.mBitsPerChannel   = 32
+    asbd.mChannelsPerFrame = channels
+    return asbd
+}
+
+print("Instantiating AUSpatialMixer (raw AudioUnit)…")
 var spatialDesc = AudioComponentDescription(
     componentType:         kAudioUnitType_Mixer,
     componentSubType:      kAudioUnitSubType_SpatialMixer,
@@ -313,91 +387,90 @@ var spatialDesc = AudioComponentDescription(
     componentFlags:        0,
     componentFlagsMask:    0)
 
-let instantiateSema = DispatchSemaphore(value: 0)
-AVAudioUnit.instantiate(with: spatialDesc, options: []) { unit, error in
-    // Runs on an Audio Unit thread — write to nonisolated(unsafe) global,
-    // then signal.  No concurrent read until after semaphore.wait() below.
-    if let e = error {
-        print("ERROR from AVAudioUnit.instantiate: \(e)")
-    }
-    gAVUnit = unit
-    instantiateSema.signal()
+guard let spatialComp = AudioComponentFindNext(nil, &spatialDesc) else {
+    print("FATAL: AUSpatialMixer component not found. Exiting.")
+    exit(1)
 }
-instantiateSema.wait()
-
-guard let spatialAVUnit = gAVUnit else {
-    print("FATAL: AUSpatialMixer instantiation returned nil. Exiting.")
+var spatialMixerOpt: AudioUnit? = nil
+let sInst = AudioComponentInstanceNew(spatialComp, &spatialMixerOpt)
+guard sInst == noErr, let spatialMixer = spatialMixerOpt else {
+    print("FATAL: AudioComponentInstanceNew(spatial) -> \(fmtStatus(sInst)). Exiting.")
     exit(1)
 }
 print("  -> AUSpatialMixer instantiated OK")
-engine.attach(spatialAVUnit)
+
+print("Instantiating DefaultOutput unit (raw AudioUnit)…")
+var outputDesc = AudioComponentDescription(
+    componentType:         kAudioUnitType_Output,
+    componentSubType:      kAudioUnitSubType_DefaultOutput,
+    componentManufacturer: kAudioUnitManufacturer_Apple,
+    componentFlags:        0,
+    componentFlagsMask:    0)
+guard let outputComp = AudioComponentFindNext(nil, &outputDesc) else {
+    print("FATAL: DefaultOutput component not found. Exiting.")
+    exit(1)
+}
+var outputUnitOpt: AudioUnit? = nil
+let oInst = AudioComponentInstanceNew(outputComp, &outputUnitOpt)
+guard oInst == noErr, let outputUnit = outputUnitOpt else {
+    print("FATAL: AudioComponentInstanceNew(output) -> \(fmtStatus(oInst)). Exiting.")
+    exit(1)
+}
+print("  -> DefaultOutput unit instantiated OK")
+
+gRenderCtx.spatialMixer = spatialMixer
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Connect audio graph
+// MARK: - Stream formats + render callbacks (deinterleaved float32 @ 48 kHz)
 //
-//   player (mono 48 kHz)
-//       -> spatialMixer  (applies binaural HRTF, head tracking)
-//           -> mainMixerNode
-//               -> outputNode (AirPods)
+//   spatial mixer  Input/0  : mono   (point-source input — required for
+//                                      PointSource spatialization)
+//   spatial mixer  Output/0 : stereo (binaural)
+//   output unit    Input/0  : stereo (pulled via AudioUnitRender on the mixer)
 //
-// Mono input on bus 0 is required for PointSource spatialization — the AU
-// treats the single-channel signal as a point in 3-D space.
-// For the spatialMixer -> mainMixer leg we pass format:nil so the engine
-// queries the mixer's output format (binaural stereo at the device rate).
-//
-// Crash-avoidance (AVFAudio DidConnectToMixer null-deref)
-// ------------------------------------------------------
-// AVAudioEngine creates `mainMixerNode` and `outputNode` lazily.  If the very
-// first connection wires an UPSTREAM leg (player -> spatialMixer) before any
-// downstream path to a realized output mixer exists, AVFAudio's
-// DidConnectToMixer / InformNodesAboutMixerConnection traversal walks downstream
-// looking for the output mixer, finds nothing realized, and dereferences null.
-//
-// Two complementary measures make this robust:
-//   (1) Force lazy realization of mainMixerNode + outputNode BEFORE any connect,
-//       so the downstream chain (mainMixer -> outputNode) already exists.
-//   (2) Connect DOWNSTREAM-FIRST: spatialMixer -> mainMixer before
-//       player -> spatialMixer, so every node has a downstream path to the
-//       output mixer at the moment it is wired.
-// Also: compute nextAvailableInputBus into a local AFTER the mixer is realized,
-// because evaluating it inline can itself realize the mixer mid-expression.
+// Audio is pulled by two render callbacks: the output unit's input callback
+// renders the spatial mixer, and the spatial mixer's input callback copies from
+// the looping source buffer. No AVAudioEngine connect() is involved, so the
+// DidConnectToMixer null-deref cannot occur.
 // ─────────────────────────────────────────────────────────────────────────────
 
-let monoFmt   = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
-let stereoFmt = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+var monoASBD   = makeFloatASBD(channels: 1)
+var stereoASBD = makeFloatASBD(channels: 2)
+let asbdSize   = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
 
-// (1) Realize the output chain first.  Referencing these properties forces the
-//     engine to create the nodes and the implicit mainMixer -> outputNode edge.
-let mainMixer = engine.mainMixerNode
-_ = engine.outputNode
+let fIn = AudioUnitSetProperty(spatialMixer, kAudioUnitProperty_StreamFormat,
+    kAudioUnitScope_Input, 0, &monoASBD, asbdSize)
+print("Format: spatialMixer Input/0  = mono48k   -> \(fmtStatus(fIn))")
 
-// Compute the destination bus into a local now that the mixer is realized.
-let mainMixerInputBus = mainMixer.nextAvailableInputBus
+let fOut = AudioUnitSetProperty(spatialMixer, kAudioUnitProperty_StreamFormat,
+    kAudioUnitScope_Output, 0, &stereoASBD, asbdSize)
+print("Format: spatialMixer Output/0 = stereo48k -> \(fmtStatus(fOut))")
 
-// (1b) Prepare the engine so the lazily-created nodes have their internal
-//      implementation objects fully realized before we wire the AUSpatialMixer.
-engine.prepare()
+let fOutIn = AudioUnitSetProperty(outputUnit, kAudioUnitProperty_StreamFormat,
+    kAudioUnitScope_Input, 0, &stereoASBD, asbdSize)
+print("Format: outputUnit  Input/0   = stereo48k -> \(fmtStatus(fOutIn))")
 
-// (2) Downstream-first: spatialMixer -> mainMixer BEFORE player -> spatialMixer.
-//     Pass an EXPLICIT stereo format for the spatial output leg.  With format:nil
-//     the engine queries the freshly-instantiated AUSpatialMixer's output format,
-//     which is uninitialised and yields a malformed connection record; the
-//     subsequent player -> spatialMixer wiring then walks that record in
-//     DidConnectToMixer and dereferences garbage.  An explicit binaural stereo
-//     format gives the mixer a valid output bus to reason about.
-engine.connect(spatialAVUnit, to: mainMixer,
-               fromBus: 0, toBus: mainMixerInputBus,
-               format: stereoFmt)
-engine.connect(player, to: spatialAVUnit,
-               fromBus: 0, toBus: 0,
-               format: monoFmt)
-print("Graph: player(mono48k) -> spatialMixer -> mainMixer -> outputNode")
+// Wire render callbacks. ctx.samples is empty until the source buffer is loaded
+// (the callbacks emit silence until then), so it is safe to set them now.
+let ctxPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(gRenderCtx).toOpaque())
+let cbSize = UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+
+var inputCB = AURenderCallbackStruct(inputProc: inputRenderProc, inputProcRefCon: ctxPtr)
+let scbIn = AudioUnitSetProperty(spatialMixer, kAudioUnitProperty_SetRenderCallback,
+    kAudioUnitScope_Input, 0, &inputCB, cbSize)
+print("RenderCB: spatialMixer Input/0 -> \(fmtStatus(scbIn))")
+
+var outputCB = AURenderCallbackStruct(inputProc: outputRenderProc, inputProcRefCon: ctxPtr)
+let scbOut = AudioUnitSetProperty(outputUnit, kAudioUnitProperty_SetRenderCallback,
+    kAudioUnitScope_Input, 0, &outputCB, cbSize)
+print("RenderCB: outputUnit  Input/0 -> \(fmtStatus(scbOut))")
+print("Graph: noise -> [renderCB] -> spatialMixer -> [renderCB] -> outputUnit -> device")
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Configure AUSpatialMixer properties
 // ─────────────────────────────────────────────────────────────────────────────
 
-let au: AudioUnit = spatialAVUnit.audioUnit
+let au: AudioUnit = spatialMixer
 print()
 print("─── Spatial Mixer Property Configuration ──────────────────────────────")
 
@@ -479,6 +552,23 @@ ok_hrtfMode = setPropU32(au: au, prop: kPropPersonalizedHRTFMode,
 print()
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Initialize both AudioUnits
+//
+// Formats, render callbacks and all spatial properties are now set, so the units
+// can allocate their render resources. Parameters are set afterwards.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let initSp = AudioUnitInitialize(spatialMixer)
+print("AudioUnitInitialize(spatialMixer) -> \(fmtStatus(initSp))")
+let initOut = AudioUnitInitialize(outputUnit)
+print("AudioUnitInitialize(outputUnit)   -> \(fmtStatus(initOut))")
+if initSp != noErr || initOut != noErr {
+    print("FATAL: AudioUnit initialization failed. Exiting.")
+    exit(1)
+}
+print()
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Spatial parameters
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -523,23 +613,31 @@ if CommandLine.arguments.count > 1 {
     print("No file arg — generating 2 s mono 48 kHz white noise (amplitude 0.15)")
     sourceBuffer = generateWhiteNoise()
 }
+
+// Copy the mono float samples into a raw heap buffer the input callback loops
+// over. (floatChannelData is deinterleaved float32 — exactly our mono ASBD.)
+// Raw buffer (not Array) so the real-time callback touches no isolated closures.
+let sourceFrames = Int(sourceBuffer.frameLength)
+if sourceFrames > 0, let ch = sourceBuffer.floatChannelData?[0] {
+    let buf = UnsafeMutablePointer<Float>.allocate(capacity: sourceFrames)
+    buf.update(from: ch, count: sourceFrames)
+    gRenderCtx.samples = buf
+    gRenderCtx.count   = sourceFrames
+}
+print("Source loaded into render context: \(gRenderCtx.count) frames (looping)")
 print()
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Start engine and playback
+// MARK: - Start rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-do {
-    try engine.start()
-    print("AVAudioEngine started")
-} catch {
-    print("FATAL: engine.start() failed: \(error)")
+let startSt = AudioOutputUnitStart(outputUnit)
+if startSt == noErr {
+    print("AudioOutputUnitStart(outputUnit) -> OK (HAL render thread running)")
+} else {
+    print("FATAL: AudioOutputUnitStart -> \(fmtStatus(startSt))")
     exit(1)
 }
-
-// Loop the buffer indefinitely so we have audio throughout the polling window.
-player.scheduleBuffer(sourceBuffer, at: nil, options: .loops, completionHandler: nil)
-player.play()
 print("Playback started (looping)")
 print()
 
@@ -622,8 +720,7 @@ for t in 1...max(1, runSeconds) {
 // MARK: - Teardown
 // ─────────────────────────────────────────────────────────────────────────────
 
-player.stop()
-engine.stop()
+AudioOutputUnitStop(outputUnit)
 sigSrc.cancel()
 print()
 
@@ -684,3 +781,9 @@ print("  Keep still — noise should sound in front and OUTSIDE your head.")
 print("  Rotate your head — it should stay anchored in front (head tracking).")
 print("  Toggle Control Center > Spatial Audio for A/B comparison.")
 print("═══════════════════════════════════════════════════════════════════════")
+
+// Dispose AudioUnits (after the final property read-backs above).
+AudioUnitUninitialize(outputUnit)
+AudioUnitUninitialize(spatialMixer)
+AudioComponentInstanceDispose(outputUnit)
+AudioComponentInstanceDispose(spatialMixer)

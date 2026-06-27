@@ -24,6 +24,21 @@ multichannel tap capability, and the legal impossibility of decoding real Atmos)
    a Dolby license).
 4. **System audio only for MVP** — no ADM BWF file player, but keep the renderer abstraction open
    so it can be added later.
+5. **Works with ANY output and WITHOUT an ear scan** (added 2026-06-27). The renderer must support
+   all output types (Headphones / BuiltInSpeakers / ExternalSpeakers) and `PersonalizedHRTFMode=Auto`
+   (personal profile if present + permitted, else **generic HRTF**). Generic binaural rendering + the
+   full control surface require **no restricted entitlement and no scan**. This makes the product's
+   core value independent of the #1 risk; entitlements + scan only unlock a premium tier. Head
+   tracking remains AirPods-only (hardware IMU); with other headphones the soundstage is static
+   binaural (expected, not a defect).
+
+### Product tiers (graceful degradation — design every component to degrade, never hard-require)
+| Tier | Output | Requires | Result |
+|---|---|---|---|
+| **Core** | any headphones | nothing | generic binaural + full manual controls |
+| **+ Head tracking** | AirPods | `coremotion.head-pose` | world-locked soundstage |
+| **+ Personalized** | AirPods + ear scan | `spatial-audio.profile-access` | personal HRTF |
+| **Speakers** | built-in / external | nothing | crosstalk-cancellation virtualization |
 
 ---
 
