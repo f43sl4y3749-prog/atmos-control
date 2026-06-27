@@ -15,20 +15,131 @@ final class EngineController: ObservableObject {
     @Published var atmosPresent = false
     @Published var outputName = "—"
 
+    // Output routing (settings window): the discovered real sinks + the user's choice.
+    @Published var outputs: [AudioOutputDevice] = []
+    @Published var selectedOutputID: AudioDeviceID?   // nil = follow current system default
+
     // Smoothed peak-hold for the meters (linear 0…1).
     @Published var meterL: Float = 0
     @Published var meterR: Float = 0
     @Published var peakHoldL: Float = 0
     @Published var peakHoldR: Float = 0
 
+    // Live head pose (radians yaw) for the radar; mirrors AirPods head tracking.
+    @Published var headYaw: Double = 0
+    @Published var headPoseLive = false
+
     private let engine = SpatialEngine()
+    private let deviceMonitor = DeviceMonitor()
+    private let motion = HeadphoneMotion()
     private var timer: Timer?
     private var savedDefault: AudioDeviceID?
+    private var activeSinkID: AudioDeviceID?   // the real device the graph is rendering to
+    private var handlingChange = false
 
     init() {
         atmosPresent = engine.atmosControlPresent()
         let cur = SpatialEngine.currentDefaultOutput()
         outputName = cur.name
+        outputs = engine.outputDevices()
+
+        motion.onYaw = { [weak self] y in
+            guard let self else { return }
+            if abs(y - self.headYaw) > 0.008 { self.headYaw = y }   // ~0.5°: limit redraw churn
+            if !self.headPoseLive { self.headPoseLive = true }
+        }
+        deviceMonitor.onChange = { [weak self] in self?.handleDeviceChange() }
+        deviceMonitor.start()
+    }
+
+    // MARK: Output devices
+
+    /// Re-enumerate the available real sinks; drop a selection that has vanished.
+    func refreshDevices() {
+        atmosPresent = engine.atmosControlPresent()
+        outputs = engine.outputDevices()
+        if let sel = selectedOutputID, !outputs.contains(where: { $0.id == sel }) {
+            selectedOutputID = nil
+        }
+    }
+
+    /// Sensible output-type default for a sink (used on power-on and device switch).
+    private func outputType(for dev: AudioOutputDevice) -> OutputType {
+        if dev.isAirPods { return .headphones }
+        return dev.name.localizedCaseInsensitiveContains("headphone") ? .headphones : .builtInSpeakers
+    }
+
+    /// Pick which real sink to route through. nil = follow the system default.
+    /// Swaps the playback graph live when running (atmos-control stays the default).
+    func selectOutput(_ dev: AudioOutputDevice?) {
+        selectedOutputID = dev?.id
+        if let d = dev { outputName = d.name; config.outputType = outputType(for: d) }
+        guard isOn else { engine.config = config; return }
+        engine.stop()
+        engine.config = config
+        do { try engine.start(outputDeviceID: dev?.id); activeSinkID = dev?.id; lastError = nil }
+        catch { lastError = "\(error)"; powerOff() }
+    }
+
+    // MARK: Device hot-swap
+
+    /// CoreAudio device list or default-output changed. Keep the picker fresh and,
+    /// if running, fail over when our real sink has vanished (e.g. AirPods unplugged).
+    private func handleDeviceChange() {
+        guard !handlingChange else { return }
+        handlingChange = true
+        defer { handlingChange = false }
+
+        atmosPresent = engine.atmosControlPresent()
+        let devices = engine.outputDevices()
+        outputs = devices
+        if let sel = selectedOutputID, !devices.contains(where: { $0.id == sel }) { selectedOutputID = nil }
+
+        guard isOn else {
+            let cur = SpatialEngine.currentDefaultOutput()
+            if cur.id != SpatialEngine.atmosControlDeviceID() { outputName = cur.name }
+            return
+        }
+        if let sink = activeSinkID, !devices.contains(where: { $0.id == sink }) {
+            recoverFromLostSink(devices)
+        }
+    }
+
+    /// Our render sink disappeared mid-session — fail over to another real device if one
+    /// exists (atmos-control stays the capture default), else power down safely.
+    private func recoverFromLostSink(_ devices: [AudioOutputDevice]) {
+        selectedOutputID = nil
+        guard let fallback = devices.first(where: { $0.isAirPods }) ?? devices.first(where: { !$0.isAirPods }) ?? devices.first else {
+            lastError = "Output device disconnected — engine stopped."
+            powerOff()
+            return
+        }
+        engine.stop()
+        config.outputType = outputType(for: fallback)
+        engine.config = config
+        do {
+            try engine.start(outputDeviceID: fallback.id)
+            activeSinkID = fallback.id
+            outputName = fallback.name
+            lastError = "Output changed — now routing to \(fallback.name)."
+            syncMotion()
+        } catch {
+            lastError = "Output device lost — \(error)"
+            powerOff()
+        }
+    }
+
+    // MARK: Head-pose motion
+
+    /// Run head-pose updates only while the engine is on and head tracking is enabled.
+    private func syncMotion() {
+        if isOn && config.headTracking && motion.isAvailable {
+            motion.start()
+        } else {
+            motion.stop()
+            headPoseLive = false
+            headYaw = 0
+        }
     }
 
     // MARK: Power
@@ -45,14 +156,21 @@ final class EngineController: ObservableObject {
         let current = SpatialEngine.currentDefaultOutput()
         savedDefault = current.id
         let devices = engine.outputDevices()
-        let real: AudioOutputDevice? = current.id == atmos
-            ? devices.first(where: { $0.isAirPods }) ?? devices.first
-            : devices.first(where: { $0.id == current.id })
+        outputs = devices
+        // Prefer the user's explicit choice; else the current default (or AirPods if
+        // the default is already the virtual sink).
+        let real: AudioOutputDevice?
+        if let sel = selectedOutputID, let d = devices.first(where: { $0.id == sel }) {
+            real = d
+        } else if current.id == atmos {
+            real = devices.first(where: { $0.isAirPods }) ?? devices.first
+        } else {
+            real = devices.first(where: { $0.id == current.id })
+        }
 
         // Auto-match output type to the sink.
         if let r = real {
-            config.outputType = r.isAirPods ? .headphones
-                : (r.name.localizedCaseInsensitiveContains("headphone") ? .headphones : .builtInSpeakers)
+            config.outputType = outputType(for: r)
             outputName = r.name
         }
         engine.config = config
@@ -61,23 +179,41 @@ final class EngineController: ObservableObject {
         SpatialEngine.setDefaultOutput(atmos)
         do {
             try engine.start(outputDeviceID: real?.id)
+            activeSinkID = real?.id ?? (current.id != atmos ? current.id : nil)
             isOn = true
             lastError = nil
             startPolling()
+            syncMotion()
         } catch {
             lastError = "\(error)"
-            if let s = savedDefault { SpatialEngine.setDefaultOutput(s) }   // restore on failure
-            savedDefault = nil
+            restoreSafeDefault()   // never leave the system default on the virtual sink
         }
     }
 
     func powerOff() {
         stopPolling()
         engine.stop()
-        if let s = savedDefault { SpatialEngine.setDefaultOutput(s); savedDefault = nil }
+        restoreSafeDefault()
         isOn = false
+        activeSinkID = nil
         state = EngineState()
         meterL = 0; meterR = 0; peakHoldL = 0; peakHoldR = 0
+        syncMotion()
+    }
+
+    /// Restore the system default to a present, real (non-virtual) device. Prefers the
+    /// saved pre-power-on default; falls back to built-in speakers / any real sink so we
+    /// never strand the default on the atmos-control loopback (which black-holes audio).
+    private func restoreSafeDefault() {
+        let atmos = SpatialEngine.atmosControlDeviceID()
+        let present = engine.outputDevices()
+        if let s = savedDefault, s != atmos, present.contains(where: { $0.id == s }) {
+            SpatialEngine.setDefaultOutput(s)
+        } else if let speakers = present.first(where: { $0.name.localizedCaseInsensitiveContains("speaker") })
+                    ?? present.first(where: { !$0.isAirPods }) ?? present.first {
+            SpatialEngine.setDefaultOutput(speakers.id)
+        }
+        savedDefault = nil
     }
 
     // MARK: Config changes
@@ -86,7 +222,7 @@ final class EngineController: ObservableObject {
     /// head tracking). Brief audio gap while running.
     func applyConfig() {
         guard isOn else { engine.config = config; return }
-        do { try engine.reconfigure(config) }
+        do { try engine.reconfigure(config); syncMotion() }
         catch { lastError = "\(error)"; powerOff() }
     }
 

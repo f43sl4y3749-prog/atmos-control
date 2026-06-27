@@ -54,21 +54,33 @@ struct RadarView: View {
                     var tick = Path(); tick.move(to: p0); tick.addLine(to: p1)
                     ctx.stroke(tick, with: .color(grid.opacity(0.5)), style: StrokeStyle(lineWidth: 1, lineCap: .round))
                 }
-                // front chevron (accent) at 12 o'clock
-                var chev = Path()
-                chev.move(to: CGPoint(x: c.x - 5, y: c.y - R - 1))
-                chev.addLine(to: CGPoint(x: c.x, y: c.y - R + 5))
-                chev.addLine(to: CGPoint(x: c.x + 5, y: c.y - R - 1))
-                ctx.stroke(chev, with: .color(.instrument), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                // Head + forward indicators rotate with the live head pose (world stays
+                // fixed); when no motion, yaw is 0 and they point straight up (front).
+                let live = controller.headPoseLive
+                let yaw = live ? controller.headYaw : 0
+                ctx.drawLayer { layer in
+                    layer.translateBy(x: c.x, y: c.y)
+                    layer.rotate(by: .radians(yaw))
+                    layer.translateBy(x: -c.x, y: -c.y)
 
-                // listener head at center, facing front
-                let head = Path(ellipseIn: CGRect(x: c.x - 6, y: c.y - 6 + 1, width: 12, height: 12))
-                ctx.fill(head, with: .color(grid.opacity(0.85)))
-                var nose = Path()
-                nose.move(to: CGPoint(x: c.x - 3.2, y: c.y - 4))
-                nose.addLine(to: CGPoint(x: c.x + 3.2, y: c.y - 4))
-                nose.addLine(to: CGPoint(x: c.x, y: c.y - 9.5))
-                ctx.fill(nose.closedSubpath, with: .color(grid.opacity(0.85)))
+                    // front chevron (accent) at the head's forward, just outside the ring
+                    var chev = Path()
+                    chev.move(to: CGPoint(x: c.x - 5, y: c.y - R - 1))
+                    chev.addLine(to: CGPoint(x: c.x, y: c.y - R + 5))
+                    chev.addLine(to: CGPoint(x: c.x + 5, y: c.y - R - 1))
+                    layer.stroke(chev, with: .color(.instrument),
+                                 style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+
+                    // listener head + nose pointing forward
+                    let headCol = live ? Color.instrument.opacity(0.9) : grid.opacity(0.85)
+                    let head = Path(ellipseIn: CGRect(x: c.x - 6, y: c.y - 6 + 1, width: 12, height: 12))
+                    layer.fill(head, with: .color(headCol))
+                    var nose = Path()
+                    nose.move(to: CGPoint(x: c.x - 3.2, y: c.y - 4))
+                    nose.addLine(to: CGPoint(x: c.x + 3.2, y: c.y - 4))
+                    nose.addLine(to: CGPoint(x: c.x, y: c.y - 9.5))
+                    layer.fill(nose.closedSubpath, with: .color(headCol))
+                }
 
                 // source dot (accent) + soft glow + ray
                 let sp = sourcePoint(c: c, R: R, az: controller.config.azimuth, distance: controller.config.distance)

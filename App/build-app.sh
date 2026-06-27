@@ -37,6 +37,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key> <true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>atmos-control reads system audio from the virtual output device in order to spatialize it.</string>
+  <key>NSMotionUsageDescription</key>
+  <string>atmos-control uses AirPods head-motion to visualize and track your head position for spatial audio.</string>
 </dict>
 </plist>
 PLIST

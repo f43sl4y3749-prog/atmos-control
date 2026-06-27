@@ -5,42 +5,70 @@ import SwiftUI
 import AppKit
 import SpatialEngine
 
+/// Carries the panel's natural (unclamped) content height up from the hidden probe.
+private struct PanelHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct PanelView: View {
     @EnvironmentObject var controller: EngineController
-    @State private var contentHeight: CGFloat = 560
+    @Environment(\.openWindow) private var openWindow
+    @State private var naturalHeight: CGFloat = 560
 
     /// Never let the panel run past the screen edge: cap at the visible frame
     /// (already excludes menu bar + Dock), leaving a little breathing room.
-    private var maxPanelHeight: CGFloat { (NSScreen.main?.visibleFrame.height ?? 900) - 12 }
+    private var maxPanelHeight: CGFloat { (NSScreen.main?.visibleFrame.height ?? 900) - 24 }
 
     var body: some View {
         ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: 11) {
-                header
-                Divider()
-
-                if !controller.atmosPresent {
-                    driverMissing
-                } else {
-                    statusStrip
-                    visualizerRow
-                    Divider()
-                    controls
-                }
-
-                if let err = controller.lastError {
-                    Text(err).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-                }
-
-                Divider()
-                footer
-            }
-            .padding(14)
-            .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { contentHeight = $0 }
+            content
         }
+        .scrollIndicators(.never)             // stable content width → no scroller-toggle jitter
         .scrollBounceBehavior(.basedOnSize)   // static when it fits, scrolls only when clamped
-        .frame(width: 332, height: min(contentHeight, maxPanelHeight))
+        .frame(width: 332, height: min(naturalHeight, maxPanelHeight))
+        .background(heightProbe)
+        .onPreferenceChange(PanelHeightKey.self) { if $0 > 0 { naturalHeight = $0 } }
         .tint(.instrument)   // unify on the single accent (segmented controls, switch, sliders)
+    }
+
+    // The panel body — rendered live in the ScrollView, and again (hidden) by `heightProbe`.
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            header
+            Divider()
+
+            if !controller.atmosPresent {
+                driverMissing
+            } else {
+                statusStrip
+                visualizerRow
+                Divider()
+                controls
+            }
+
+            if let err = controller.lastError {
+                Text(err).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+            footer
+        }
+        .padding(14)
+    }
+
+    // A hidden, vertically-unconstrained copy. Because it uses fixedSize, its measured
+    // height is the content's *natural* height regardless of the clamp applied above — so
+    // feeding it back into the frame can't oscillate (the layout loop the naive version hit).
+    private var heightProbe: some View {
+        content
+            .frame(width: 332)
+            .fixedSize(horizontal: false, vertical: true)
+            .background(GeometryReader { g in
+                Color.clear.preference(key: PanelHeightKey.self, value: g.size.height)
+            })
+            .hidden()
+            .allowsHitTesting(false)
     }
 
     // MARK: Header
@@ -125,13 +153,23 @@ struct PanelView: View {
     // MARK: Footer
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 10) {
             Text("Spatial Audio · personalized binaural")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
             Spacer()
+            Button { openSettings() } label: {
+                Image(systemName: "slider.horizontal.3").font(.system(size: 13))
+            }
+            .buttonStyle(.borderless)
+            .help("Settings — full control surface")
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .controlSize(.small)
         }
+    }
+
+    private func openSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "settings")
     }
 
     private var driverMissing: some View {

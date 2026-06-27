@@ -22,29 +22,61 @@ struct AtmosControlApp: App {
             MenuBarGlyph(on: controller.isOn)
         }
         .menuBarExtraStyle(.window)
+
+        // Full control surface — opened from the panel's settings button. A normal
+        // resizable window (NOT sized to content: a grouped Form in a content-sized
+        // window infinite-loops AppKit's constraint pass).
+        Window("atmos-control — Settings", id: "settings") {
+            SettingsView()
+                .environmentObject(controller)
+        }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 480, height: 620)
+        .defaultPosition(.center)
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var previewWindow: NSWindow?
+    private var previewWindows: [NSWindow] = []
     private let previewController = EngineController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let preview = ProcessInfo.processInfo.environment["ATMOS_PREVIEW"] == "1"
+        let mode = ProcessInfo.processInfo.environment["ATMOS_PREVIEW"] ?? ""
+        let preview = !mode.isEmpty
         NSApp.setActivationPolicy(preview ? .regular : .accessory)   // accessory = menu-bar agent
         guard preview else { return }
 
-        // Dev-only: ATMOS_PREVIEW=1 opens the panel in a window for screenshotting.
-        let host = NSHostingController(rootView: PanelView().environmentObject(previewController))
-        host.sizingOptions = [.preferredContentSize]
-        let win = NSWindow(contentViewController: host)
-        win.title = "atmos-control"
-        win.styleMask = [.titled, .closable]
-        win.center()
-        win.makeKeyAndOrderFront(nil)
+        // Dev-only: ATMOS_PREVIEW=1|panel|settings opens the surface(s) in windows for screenshotting.
+        if mode == "1" || mode == "panel" {
+            previewWindow(PanelView().environmentObject(previewController), title: "atmos-control", x: 40)
+        }
+        if mode == "1" || mode == "settings" {
+            previewWindow(SettingsView().environmentObject(previewController), title: "Settings", x: 400,
+                          fixedSize: NSSize(width: 480, height: 620))
+        }
         NSApp.activate(ignoringOtherApps: true)
-        previewWindow = win
+    }
+
+    private func previewWindow<V: View>(_ root: V, title: String, x: CGFloat, fixedSize: NSSize? = nil) {
+        let host = NSHostingController(rootView: root)
+        var mask: NSWindow.StyleMask = [.titled, .closable]
+        if let s = fixedSize {
+            host.preferredContentSize = s   // explicit size: a Form must not drive window size
+            mask.insert(.resizable)
+        } else {
+            host.sizingOptions = [.preferredContentSize]
+        }
+        let win = NSWindow(contentViewController: host)
+        win.title = title
+        win.styleMask = mask
+        if let s = fixedSize { win.setContentSize(s) }
+        let vf = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        win.setFrameTopLeftPoint(NSPoint(x: vf.minX + x, y: vf.maxY - 20))
+        win.level = .floating   // sit above other apps for screenshotting
+        win.makeKeyAndOrderFront(nil)
+        win.orderFrontRegardless()
+        previewWindows.append(win)
     }
 }
 
