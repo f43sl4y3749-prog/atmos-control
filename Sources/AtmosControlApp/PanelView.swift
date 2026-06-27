@@ -5,30 +5,28 @@ import SwiftUI
 import AppKit
 import SpatialEngine
 
-/// Carries the panel's natural (unclamped) content height up from the hidden probe.
-private struct PanelHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
 struct PanelView: View {
     @EnvironmentObject var controller: EngineController
     @Environment(\.openWindow) private var openWindow
-    @State private var naturalHeight: CGFloat = 560
 
     /// Never let the panel run past the screen edge: cap at the visible frame
     /// (already excludes menu bar + Dock), leaving a little breathing room.
     private var maxPanelHeight: CGFloat { (NSScreen.main?.visibleFrame.height ?? 900) - 24 }
 
+    /// Deterministic per-state height — no measure⇄resize loop and (crucially) no second
+    /// render pass. Clamped to the screen; the ScrollView absorbs any residual overflow.
+    private var panelHeight: CGFloat {
+        guard controller.atmosPresent else { return min(180, maxPanelHeight) }
+        return min(545 + (controller.lastError != nil ? 30 : 0), maxPanelHeight)
+    }
+
     var body: some View {
         ScrollView(.vertical) {
             content
         }
-        .scrollIndicators(.never)             // stable content width → no scroller-toggle jitter
+        .scrollIndicators(.never)
         .scrollBounceBehavior(.basedOnSize)   // static when it fits, scrolls only when clamped
-        .frame(width: 332, height: min(naturalHeight, maxPanelHeight))
-        .background(heightProbe)
-        .onPreferenceChange(PanelHeightKey.self) { if $0 > 0 { naturalHeight = $0 } }
+        .frame(width: 332, height: panelHeight)
         .tint(.instrument)   // unify on the single accent (segmented controls, switch, sliders)
     }
 
@@ -55,20 +53,6 @@ struct PanelView: View {
             footer
         }
         .padding(14)
-    }
-
-    // A hidden, vertically-unconstrained copy. Because it uses fixedSize, its measured
-    // height is the content's *natural* height regardless of the clamp applied above — so
-    // feeding it back into the frame can't oscillate (the layout loop the naive version hit).
-    private var heightProbe: some View {
-        content
-            .frame(width: 332)
-            .fixedSize(horizontal: false, vertical: true)
-            .background(GeometryReader { g in
-                Color.clear.preference(key: PanelHeightKey.self, value: g.size.height)
-            })
-            .hidden()
-            .allowsHitTesting(false)
     }
 
     // MARK: Header

@@ -19,7 +19,7 @@ struct AtmosControlApp: App {
             PanelView()
                 .environmentObject(controller)
         } label: {
-            MenuBarGlyph(on: controller.isOn)
+            Image(nsImage: GlyphCache.image(on: controller.isOn))
         }
         .menuBarExtraStyle(.window)
 
@@ -80,7 +80,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Menu-bar glyph (binaural mark; state-colored)
+// MARK: - Menu-bar glyph (binaural mark) → rendered to a template NSImage
+
+/// A SwiftUI `Canvas` used directly as a `MenuBarExtra` label renders blank, so we
+/// pre-render the glyph to a TEMPLATE NSImage (adapts to light/dark menu bars).
+/// Cached: at most one render per state, not one per @Published tick.
+@MainActor
+enum GlyphCache {
+    private static var cache: [Bool: NSImage] = [:]
+    static func image(on: Bool) -> NSImage {
+        if let img = cache[on] { return img }
+        let renderer = ImageRenderer(content: MenuBarGlyph(on: on).frame(width: 18, height: 18))
+        renderer.scale = 2
+        let img = renderer.nsImage ?? NSImage()
+        img.isTemplate = true   // menu bar tints it for the active appearance
+        cache[on] = img
+        return img
+    }
+}
 
 struct MenuBarGlyph: View {
     let on: Bool
