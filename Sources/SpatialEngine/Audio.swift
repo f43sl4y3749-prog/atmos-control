@@ -34,14 +34,30 @@ func check(_ status: OSStatus, _ label: String) -> Bool {
 // MARK: - AUSpatialMixer property IDs + enum values (numeric; CLT-safe)
 // ---------------------------------------------------------------------------
 
+let kPropRenderingFlags:                AudioUnitPropertyID = 3003  // Input, UInt32 bitmask
 let kPropSourceMode:                    AudioUnitPropertyID = 3005
+let kPropDistanceParams:                AudioUnitPropertyID = 3010  // Input, MixerDistanceParams
+let kPropAttenuationCurve:              AudioUnitPropertyID = 3013  // Input, UInt32 enum
 let kPropOutputType:                    AudioUnitPropertyID = 3100
+let kPropPointSourceInHeadMode:         AudioUnitPropertyID = 3103  // Input, UInt32 (0 Mono / 1 Bypass)
 let kPropEnableHeadTracking:            AudioUnitPropertyID = 3111
 let kPropPersonalizedHRTFMode:          AudioUnitPropertyID = 3113
 let kPropAnyInputUsingPersonalizedHRTF: AudioUnitPropertyID = 3116
 
 let kSrcModePointSource: UInt32 = 2
 let kSrcModeAmbienceBed: UInt32 = 3
+
+// Rendering flags (gate distance attenuation + inter-aural time delay).
+let kRenderFlagInterAuralDelay: UInt32 = 1 << 0   // 0x1
+let kRenderFlagDistanceAtten:   UInt32 = 1 << 2   // 0x4
+let kAttenuationCurveInverse:   UInt32 = 2        // natural 1/r falloff
+let kInHeadModeBypass:          UInt32 = 1        // sources move OUTSIDE the head
+
+/// Distance attenuation envelope (matches AudioToolbox `MixerDistanceParams`, 3×Float32).
+struct DistanceParams { var referenceDistance: Float32; var maxDistance: Float32; var maxAttenuation: Float32 }
+
+/// Half-width (degrees) of the two virtual speakers in the dual-point-source topology.
+let kStereoSpreadDegrees: Float = 30
 
 let kParamAzimuth:   AudioUnitParameterID = 0   // ±180°
 let kParamElevation: AudioUnitParameterID = 1   // ±90°
@@ -155,9 +171,11 @@ final class Ctx: @unchecked Sendable {
     var spatialMixer:    AudioUnit? = nil
     var spatialize:      Bool = false
     var spatialBed:      Bool = false
+    var spatialDualPoint: Bool = false           // two mono point-source input buses (L/R)
     var dmL:             UnsafeMutablePointer<Float>? = nil
     var dmR:             UnsafeMutablePointer<Float>? = nil
     var spatialMaxFrames: UInt32 = 0
+    var lastStagedSampleTime: Float64 = -1        // dual-point: stage the ring once per render cycle
 }
 
 // ---------------------------------------------------------------------------
@@ -234,9 +252,10 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
 }
 
 // Sole ring consumer in spatialize mode (runs inside AudioUnitRender on the
-// playback HAL thread). bed = stereo copy; point = mono downmix.
+// playback HAL thread). dualPoint = stereo split across two mono buses;
+// bed = stereo copy; mono point = mono downmix.
 nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
-    inRefCon, _, _, _, inNumberFrames, ioData
+    inRefCon, _, inTimeStamp, inBusNumber, inNumberFrames, ioData
 ) -> OSStatus in
     guard let ioData else { return noErr }
     let ctx = Unmanaged<Ctx>.fromOpaque(inRefCon).takeUnretainedValue()
@@ -245,6 +264,26 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
     let nbuf = abl.count
     guard n <= ctx.spatialMaxFrames else {
         var b = 0; while b < nbuf { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
+        return noErr
+    }
+    if ctx.spatialDualPoint {
+        guard let dmL = ctx.dmL, let dmR = ctx.dmR else {
+            var b = 0; while b < nbuf { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
+            return noErr
+        }
+        // The mixer pulls bus 0 then bus 1 within one render cycle (same timestamp).
+        // Read the stereo ring ONCE per cycle into the staging buffers, then hand the
+        // matching channel to whichever bus is being pulled (bus 0 = L, bus 1 = R).
+        let st = inTimeStamp.pointee.mSampleTime
+        if st != ctx.lastStagedSampleTime {
+            ctx.ring.read(ch0: dmL, ch1: dmR, frameCount: n)
+            ctx.lastStagedSampleTime = st
+        }
+        let src = (inBusNumber == 0) ? dmL : dmR    // mono bus → 1 buffer
+        if let p = abl[0].mData {
+            memcpy(p, src, Int(n) * 4)
+            abl[0].mDataByteSize = n * 4
+        }
         return noErr
     }
     if ctx.spatialBed {
@@ -347,7 +386,13 @@ func setU32(_ unit: AudioUnit, _ prop: AudioUnitPropertyID, scope: AudioUnitScop
 
 /// Instantiate + fully configure an AUSpatialMixer per the supplied config values.
 /// Returns an INITIALIZED unit. Output/0 = stereo48k binaural.
-func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, bed: Bool,
+///
+/// Topology by mode:
+///  - dualPointStereo: TWO mono PointSource buses (L/R virtual speakers at ±spread) —
+///    externalizes a stereo feed and makes az/el/distance audible (the default).
+///  - ambienceBedStereo: one stereo far-field AmbienceBed (az/el rotate; distance inert).
+///  - pointSourceMono: one mono PointSource (downmix; distance works, image collapses).
+func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: SourceRenderMode,
                       algo: UInt32, algoName: String, outputType: UInt32, outputTypeName: String,
                       hrtfMode: UInt32, hrtfModeName: String, headTrack: UInt32) -> AudioUnit? {
     var desc = AudioComponentDescription(
@@ -358,38 +403,68 @@ func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, bed: B
     guard check(AudioComponentInstanceNew(comp, &unitOpt), "spatial AudioComponentInstanceNew"),
           let unit = unitOpt else { return nil }
 
-    var inFmt     = makeFloatASBD(channels: bed ? 2 : 1)
-    var stereoFmt = makeFloatASBD(channels: 2)
+    let bed       = mode.isBed
+    let busCount  = mode.inputBusCount
+    let chPerBus: UInt32 = bed ? 2 : 1
     let asbdSize  = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-    check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &inFmt, asbdSize),
-          "spatial StreamFormat Input/0 = \(bed ? "stereo48k" : "mono48k")")
+    let srcMode:  UInt32 = bed ? kSrcModeAmbienceBed : kSrcModePointSource
+
+    // Output is always stereo binaural.
+    var stereoFmt = makeFloatASBD(channels: 2)
     check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &stereoFmt, asbdSize),
           "spatial StreamFormat Output/0 = stereo48k")
 
-    if bed {
-        var layout = AudioChannelLayout()
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
-        layout.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
-        layout.mNumberChannelDescriptions = 0
-        check(AudioUnitSetProperty(unit, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0,
-                                   &layout, UInt32(MemoryLayout<AudioChannelLayout>.size)),
-              "spatial AudioChannelLayout Input/0 = Stereo")
+    // Grow the input element count BEFORE configuring the extra bus.
+    if busCount > 1 {
+        var count = busCount
+        check(AudioUnitSetProperty(unit, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0,
+                                   &count, UInt32(MemoryLayout<UInt32>.size)), "spatial ElementCount Input=\(busCount)")
     }
 
     var maxF = maxFrames
     check(AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
                                &maxF, UInt32(MemoryLayout<UInt32>.size)), "spatial MaximumFramesPerSlice=\(maxFrames)")
 
-    var inputCB = AURenderCallbackStruct(inputProc: spatialInputCallback, inputProcRefCon: ctxPtr)
-    check(AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
-                               &inputCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)),
-          "spatial SetRenderCallback Input/0")
+    for bus in 0..<busCount {
+        var inFmt = makeFloatASBD(channels: chPerBus)
+        check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, bus, &inFmt, asbdSize),
+              "spatial StreamFormat Input/\(bus) = \(bed ? "stereo48k" : "mono48k")")
 
-    setU32(unit, kAudioUnitProperty_SpatializationAlgorithm, scope: kAudioUnitScope_Input, element: 0,
-           value: algo, label: "SpatializationAlgorithm=\(algoName)(\(algo)) [Input/0]")
-    let srcMode: UInt32 = bed ? kSrcModeAmbienceBed : kSrcModePointSource
-    setU32(unit, kPropSourceMode, scope: kAudioUnitScope_Input, element: 0,
-           value: srcMode, label: "SourceMode=\(bed ? "AmbienceBed" : "PointSource")(\(srcMode)) [3005/Input/0]")
+        if bed {
+            var layout = AudioChannelLayout()
+            layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+            layout.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
+            layout.mNumberChannelDescriptions = 0
+            check(AudioUnitSetProperty(unit, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, bus,
+                                       &layout, UInt32(MemoryLayout<AudioChannelLayout>.size)),
+                  "spatial AudioChannelLayout Input/\(bus) = Stereo")
+        }
+
+        var inputCB = AURenderCallbackStruct(inputProc: spatialInputCallback, inputProcRefCon: ctxPtr)
+        check(AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, bus,
+                                   &inputCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)),
+              "spatial SetRenderCallback Input/\(bus)")
+
+        setU32(unit, kAudioUnitProperty_SpatializationAlgorithm, scope: kAudioUnitScope_Input, element: bus,
+               value: algo, label: "SpatializationAlgorithm=\(algoName)(\(algo)) [Input/\(bus)]")
+        setU32(unit, kPropSourceMode, scope: kAudioUnitScope_Input, element: bus,
+               value: srcMode, label: "SourceMode=\(bed ? "AmbienceBed" : "PointSource")(\(srcMode)) [3005/Input/\(bus)]")
+
+        // Distance attenuation + externalization only matter for point sources (no-op for a far-field bed).
+        if !bed {
+            setU32(unit, kPropRenderingFlags, scope: kAudioUnitScope_Input, element: bus,
+                   value: kRenderFlagInterAuralDelay | kRenderFlagDistanceAtten,
+                   label: "RenderingFlags=ITD|DistanceAtten(0x5) [3003/Input/\(bus)]")
+            var dp = DistanceParams(referenceDistance: 0.3, maxDistance: 6.0, maxAttenuation: 40.0)
+            check(AudioUnitSetProperty(unit, kPropDistanceParams, kAudioUnitScope_Input, bus,
+                                       &dp, UInt32(MemoryLayout<DistanceParams>.size)),
+                  "DistanceParams ref=0.3 max=6 atten=40dB [3010/Input/\(bus)]")
+            setU32(unit, kPropAttenuationCurve, scope: kAudioUnitScope_Input, element: bus,
+                   value: kAttenuationCurveInverse, label: "AttenuationCurve=Inverse [3013/Input/\(bus)]")
+            setU32(unit, kPropPointSourceInHeadMode, scope: kAudioUnitScope_Input, element: bus,
+                   value: kInHeadModeBypass, label: "PointSourceInHeadMode=Bypass [3103/Input/\(bus)]")
+        }
+    }
 
     var outType = outputType
     let sGlobal = AudioUnitSetProperty(unit, kPropOutputType, kAudioUnitScope_Global, 0,

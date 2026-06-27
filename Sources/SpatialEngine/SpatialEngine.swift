@@ -38,15 +38,23 @@ public enum SpatAlgorithm: UInt32, CaseIterable, Sendable, Identifiable {
 }
 
 public enum SourceRenderMode: String, CaseIterable, Sendable, Identifiable {
-    case ambienceBedStereo, pointSourceMono
+    case dualPointStereo, ambienceBedStereo, pointSourceMono
     public var id: String { rawValue }
-    public var label: String { self == .ambienceBedStereo ? "Stereo Bed" : "Mono Point" }
+    public var label: String {
+        switch self {
+        case .dualPointStereo:   return "Stereo Points"
+        case .ambienceBedStereo: return "Stereo Bed"
+        case .pointSourceMono:   return "Mono Point"
+        }
+    }
     var isBed: Bool { self == .ambienceBedStereo }
+    var isDualPoint: Bool { self == .dualPointStereo }
+    var inputBusCount: UInt32 { self == .dualPointStereo ? 2 : 1 }
 }
 
 public struct SpatialConfig: Sendable, Equatable {
     public var spatialize: Bool = true                 // false = direct passthrough (debug)
-    public var sourceMode: SourceRenderMode = .ambienceBedStereo
+    public var sourceMode: SourceRenderMode = .dualPointStereo
     public var outputType: OutputType = .headphones
     public var hrtfMode: HRTFMode = .auto
     public var algorithm: SpatAlgorithm = .useOutputType
@@ -182,11 +190,12 @@ public final class SpatialEngine: @unchecked Sendable {
 
         // --- Spatial mixer ---
         if config.spatialize {
-            let bed = config.sourceMode.isBed
+            let mode = config.sourceMode
             let spatialMax = max(playMax, ctx.captureBufSize, 4096)
-            ctx.spatialBed = bed
+            ctx.spatialBed = mode.isBed
+            ctx.spatialDualPoint = mode.isDualPoint
             guard let mixer = makeSpatialMixer(
-                ctxPtr: ctxPtr, maxFrames: spatialMax, bed: bed,
+                ctxPtr: ctxPtr, maxFrames: spatialMax, mode: mode,
                 algo: config.algorithm.rawValue, algoName: config.algorithm.label,
                 outputType: config.outputType.rawValue, outputTypeName: config.outputType.label,
                 hrtfMode: config.hrtfMode.rawValue, hrtfModeName: config.hrtfMode.label,
@@ -282,10 +291,23 @@ public final class SpatialEngine: @unchecked Sendable {
     }
 
     private func applySourceParams(mixer: AudioUnit) {
-        AudioUnitSetParameter(mixer, kParamAzimuth,   kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.azimuth), 0)
-        AudioUnitSetParameter(mixer, kParamElevation, kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.elevation), 0)
-        AudioUnitSetParameter(mixer, kParamDistance,  kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.distance), 0)
-        AudioUnitSetParameter(mixer, kParamGain,      kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.gain), 0)
+        if config.sourceMode.isDualPoint {
+            // Two virtual speakers: bus 0 = L (az − spread), bus 1 = R (az + spread);
+            // config.azimuth rotates the whole stage. el/distance/gain shared.
+            let spread = kStereoSpreadDegrees
+            AudioUnitSetParameter(mixer, kParamAzimuth, kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.azimuth - spread), 0)
+            AudioUnitSetParameter(mixer, kParamAzimuth, kAudioUnitScope_Input, 1, AudioUnitParameterValue(config.azimuth + spread), 0)
+            for e: AudioUnitElement in [0, 1] {
+                AudioUnitSetParameter(mixer, kParamElevation, kAudioUnitScope_Input, e, AudioUnitParameterValue(config.elevation), 0)
+                AudioUnitSetParameter(mixer, kParamDistance,  kAudioUnitScope_Input, e, AudioUnitParameterValue(config.distance), 0)
+                AudioUnitSetParameter(mixer, kParamGain,      kAudioUnitScope_Input, e, AudioUnitParameterValue(config.gain), 0)
+            }
+        } else {
+            AudioUnitSetParameter(mixer, kParamAzimuth,   kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.azimuth), 0)
+            AudioUnitSetParameter(mixer, kParamElevation, kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.elevation), 0)
+            AudioUnitSetParameter(mixer, kParamDistance,  kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.distance), 0)
+            AudioUnitSetParameter(mixer, kParamGain,      kAudioUnitScope_Input, 0, AudioUnitParameterValue(config.gain), 0)
+        }
     }
 
     /// Apply a new config. Properties that require a graph rebuild (output type,

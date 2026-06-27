@@ -4,7 +4,7 @@
 //
 // Env:
 //   SPATIALIZE=0|1   insert the spatial mixer (default 1; 0 = direct passthrough)
-//   SRC_MODE=bed|point   stereo AmbienceBed (default) vs mono PointSource
+//   SRC_MODE=dual|bed|point   dual PointSource L/R (default) | stereo AmbienceBed | mono PointSource
 //   OUTPUT_TYPE=headphones|builtin|external
 //   HRTF_MODE=auto|on|off    PersonalizedHRTFMode
 //   ALGO=useoutputtype|hrtf|hrtfhq
@@ -28,7 +28,11 @@ func envFlag(_ k: String, default def: Bool) -> Bool {
 // --- Build config from env ---
 var cfg = SpatialConfig()
 cfg.spatialize = envFlag("SPATIALIZE", default: true)
-cfg.sourceMode = (env("SRC_MODE")?.lowercased() == "point") ? .pointSourceMono : .ambienceBedStereo
+switch env("SRC_MODE")?.lowercased() {
+case "bed":   cfg.sourceMode = .ambienceBedStereo
+case "point": cfg.sourceMode = .pointSourceMono
+default:      cfg.sourceMode = .dualPointStereo
+}
 switch env("OUTPUT_TYPE")?.lowercased() {
 case "builtin":  cfg.outputType = .builtInSpeakers
 case "external": cfg.outputType = .externalSpeakers
