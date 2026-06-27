@@ -6,6 +6,14 @@ import SwiftUI
 import CoreAudio
 import SpatialEngine
 
+/// How the engine captures system audio.
+enum CaptureMode: String, CaseIterable, Identifiable {
+    case processTap      // muting process tap; AirPods stay default → personalized HRTF + no black-hole
+    case loopbackDriver  // hijack the default to the atmos-control loopback; generic HRTF only
+    var id: String { rawValue }
+    var label: String { self == .processTap ? "Personalized (tap)" : "Loopback driver" }
+}
+
 @MainActor
 final class EngineController: ObservableObject {
     @Published var isOn = false
@@ -18,6 +26,7 @@ final class EngineController: ObservableObject {
     // Output routing (settings window): the discovered real sinks + the user's choice.
     @Published var outputs: [AudioOutputDevice] = []
     @Published var selectedOutputID: AudioDeviceID?   // nil = follow current system default
+    @Published var captureMode: CaptureMode = .processTap   // default: personalized, no black-hole
 
     // Smoothed peak-hold for the meters (linear 0…1).
     @Published var meterL: Float = 0
@@ -32,11 +41,17 @@ final class EngineController: ObservableObject {
     private let engine = SpatialEngine()
     private let deviceMonitor = DeviceMonitor()
     private let motion = HeadphoneMotion()
+    private let tap = ProcessTap()
     private var timer: Timer?
     private var savedDefault: AudioDeviceID?
     private var activeSinkID: AudioDeviceID?   // the real device the graph is rendering to
+    private var activeCaptureID: AudioDeviceID?  // tap aggregate (tap mode) or nil (loopback)
     private var handlingChange = false
     private var visibleSurfaces = 0            // open windows observing live state
+
+    /// The engine can run if either capture path is available. The process tap needs no
+    /// driver, so the only hard requirement for loopback mode is the HAL device.
+    var canRun: Bool { captureMode == .processTap || atmosPresent }
 
     init() {
         atmosPresent = engine.atmosControlPresent()
@@ -78,7 +93,7 @@ final class EngineController: ObservableObject {
         guard isOn else { engine.config = config; return }
         engine.stop()
         engine.config = config
-        do { try engine.start(outputDeviceID: dev?.id); activeSinkID = dev?.id; lastError = nil }
+        do { try engine.start(outputDeviceID: dev?.id, captureDeviceID: activeCaptureID); activeSinkID = dev?.id; lastError = nil }
         catch { lastError = "\(error)"; powerOff() }
     }
 
@@ -119,7 +134,7 @@ final class EngineController: ObservableObject {
         config.outputType = outputType(for: fallback)
         engine.config = config
         do {
-            try engine.start(outputDeviceID: fallback.id)
+            try engine.start(outputDeviceID: fallback.id, captureDeviceID: activeCaptureID)
             activeSinkID = fallback.id
             outputName = fallback.name
             lastError = "Output changed — now routing to \(fallback.name)."
@@ -164,17 +179,51 @@ final class EngineController: ObservableObject {
 
     func powerOn() {
         atmosPresent = engine.atmosControlPresent()
+        if captureMode == .processTap, startTapMode() { return }
+        startLoopbackMode()   // explicit loopback, or process-tap fell back
+    }
+
+    /// Personalized capture via a muting process tap. AirPods stay the default output so
+    /// property 3116 engages; we never hijack the default → no black-hole, nothing to restore.
+    private func startTapMode() -> Bool {
+        let devices = engine.outputDevices()
+        outputs = devices
+        let current = SpatialEngine.currentDefaultOutput()
+        // Render to the current default (where 3116 keys) unless the user picked a sink.
+        let real: AudioOutputDevice?
+        if let sel = selectedOutputID, let d = devices.first(where: { $0.id == sel }) { real = d }
+        else { real = devices.first(where: { $0.id == current.id }) ?? devices.first(where: { $0.isAirPods }) }
+
+        do {
+            let aggID = try tap.start(muted: true)
+            if let r = real { config.outputType = outputType(for: r); outputName = r.name }
+            engine.config = config
+            try engine.start(outputDeviceID: real?.id, captureDeviceID: aggID)
+            activeCaptureID = aggID
+            activeSinkID = real?.id
+            savedDefault = nil
+            isOn = true
+            lastError = nil
+            updateActivity()
+            return true
+        } catch {
+            tap.stop()
+            lastError = "Personalized capture unavailable (\(error)) — using loopback."
+            return false
+        }
+    }
+
+    /// Loopback capture: hijack the system default to the atmos-control HAL device.
+    /// Generic HRTF only (personalization blocked by the virtual default); restores on off.
+    private func startLoopbackMode() {
         guard let atmos = SpatialEngine.atmosControlDeviceID() else {
-            lastError = "atmos-control device not found — is the HAL driver installed?"
+            lastError = "atmos-control device not found — install the HAL driver, or use Personalized (tap) mode."
             return
         }
-        // The current default output is the real sink we route through (e.g. AirPods).
         let current = SpatialEngine.currentDefaultOutput()
         savedDefault = current.id
         let devices = engine.outputDevices()
         outputs = devices
-        // Prefer the user's explicit choice; else the current default (or AirPods if
-        // the default is already the virtual sink).
         let real: AudioOutputDevice?
         if let sel = selectedOutputID, let d = devices.first(where: { $0.id == sel }) {
             real = d
@@ -183,18 +232,13 @@ final class EngineController: ObservableObject {
         } else {
             real = devices.first(where: { $0.id == current.id })
         }
-
-        // Auto-match output type to the sink.
-        if let r = real {
-            config.outputType = outputType(for: r)
-            outputName = r.name
-        }
+        if let r = real { config.outputType = outputType(for: r); outputName = r.name }
         engine.config = config
 
-        // Route system audio into atmos-control, then start the engine → real sink.
         SpatialEngine.setDefaultOutput(atmos)
         do {
-            try engine.start(outputDeviceID: real?.id)
+            try engine.start(outputDeviceID: real?.id, captureDeviceID: nil)
+            activeCaptureID = nil
             activeSinkID = real?.id ?? (current.id != atmos ? current.id : nil)
             isOn = true
             lastError = nil
@@ -207,12 +251,21 @@ final class EngineController: ObservableObject {
 
     func powerOff() {
         engine.stop()
-        restoreSafeDefault()
+        if tap.isActive { tap.stop() }
+        if activeCaptureID == nil { restoreSafeDefault() } else { savedDefault = nil }  // only loopback hijacked the default
         isOn = false
         activeSinkID = nil
+        activeCaptureID = nil
         state = EngineState()
         meterL = 0; meterR = 0; peakHoldL = 0; peakHoldR = 0
         updateActivity()
+    }
+
+    /// Switch the capture path (restarts the engine if running).
+    func setCaptureMode(_ m: CaptureMode) {
+        guard captureMode != m else { return }
+        captureMode = m
+        if isOn { powerOff(); powerOn() }
     }
 
     /// Restore the system default to a present, real (non-virtual) device. Prefers the

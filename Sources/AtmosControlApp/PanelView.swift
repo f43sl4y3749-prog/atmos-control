@@ -38,7 +38,7 @@ struct PanelView: View {
             header
             Divider()
 
-            if !controller.atmosPresent {
+            if !controller.canRun {
                 driverMissing
             } else {
                 statusStrip
@@ -67,7 +67,7 @@ struct PanelView: View {
             Toggle("", isOn: Binding(get: { controller.isOn }, set: { _ in controller.toggle() }))
                 .toggleStyle(.switch)
                 .labelsHidden()
-                .disabled(!controller.atmosPresent)
+                .disabled(!controller.canRun)
                 .help(controller.isOn ? "Stop routing system audio through the spatializer"
                                        : "Route all system audio through the spatializer")
         }

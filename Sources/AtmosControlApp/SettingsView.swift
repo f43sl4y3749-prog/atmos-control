@@ -27,6 +27,9 @@ struct SettingsView: View {
 
     private var routing: some View {
         Section {
+            Picker("Capture", selection: captureModeBinding) {
+                ForEach(CaptureMode.allCases) { Text($0.label).tag($0) }
+            }
             Picker("Output device", selection: outputBinding) {
                 Text("Follow system default").tag(AudioDeviceID?.none)
                 ForEach(controller.outputs) { d in
@@ -37,16 +40,20 @@ struct SettingsView: View {
                 ForEach(OutputType.allCases) { Text($0.label).tag($0) }
             }
             LabeledContent("Signal path") {
-                Text(controller.isOn ? "system → atmos-control → \(controller.outputName)" : "idle")
+                Text(controller.isOn ? "system → \(captureLabel) → \(controller.outputName)" : "idle")
                     .foregroundStyle(.secondary).font(.system(.callout, design: .monospaced))
                     .lineLimit(1).truncationMode(.middle)
             }
         } header: {
             Text("Routing")
         } footer: {
-            Text("All system audio is captured by the virtual device, spatialized, then sent to the chosen sink.")
+            Text(controller.captureMode == .processTap
+                 ? "Personalized (tap): a muted process tap captures all apps while your headphones stay the system default — so Apple’s personalized HRTF can engage. No virtual driver needed."
+                 : "Loopback driver: all audio is routed through the atmos-control virtual device. Works with any output, but personalized HRTF can’t engage (generic binaural).")
         }
     }
+
+    private var captureLabel: String { controller.captureMode == .processTap ? "tap" : "atmos-control" }
 
     // MARK: Spatialization
 
@@ -125,6 +132,10 @@ struct SettingsView: View {
     private var outputBinding: Binding<AudioDeviceID?> {
         Binding(get: { controller.selectedOutputID },
                 set: { id in controller.selectOutput(controller.outputs.first(where: { $0.id == id })) })
+    }
+
+    private var captureModeBinding: Binding<CaptureMode> {
+        Binding(get: { controller.captureMode }, set: { controller.setCaptureMode($0) })
     }
 
     @ViewBuilder
