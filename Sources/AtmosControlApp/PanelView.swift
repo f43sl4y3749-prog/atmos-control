@@ -6,7 +6,7 @@ import AppKit
 import SpatialEngine
 
 struct PanelView: View {
-    @EnvironmentObject var controller: EngineController
+    @Environment(EngineController.self) private var controller
     @Environment(\.openWindow) private var openWindow
 
     /// Never let the panel run past the screen edge: cap at the visible frame
@@ -15,8 +15,13 @@ struct PanelView: View {
 
     /// Deterministic per-state height — no measure⇄resize loop and (crucially) no second
     /// render pass. Clamped to the screen; the ScrollView absorbs any residual overflow.
+    /// MUST key off the SAME predicate the content branch uses (`canRun`, see `content`):
+    /// keying on `atmosPresent` pinned the full ~545pt surface into a 180pt frame in the
+    /// default process-tap / no-driver state (atmosPresent == false but canRun == true),
+    /// so the popover opened clipped at 332×180 — and forced AppKit to reconcile a
+    /// 180-vs-545 frame/content mismatch every layout pass.
     private var panelHeight: CGFloat {
-        guard controller.atmosPresent else { return min(180, maxPanelHeight) }
+        guard controller.canRun else { return min(180, maxPanelHeight) }   // compact "driver missing" surface
         return min(545 + (controller.lastError != nil ? 30 : 0), maxPanelHeight)
     }
 
@@ -28,11 +33,14 @@ struct PanelView: View {
         .scrollBounceBehavior(.basedOnSize)   // static when it fits, scrolls only when clamped
         .frame(width: 332, height: panelHeight)
         .tint(.instrument)   // unify on the single accent (segmented controls, switch, sliders)
-        .onAppear { controller.surfaceAppeared() }
-        .onDisappear { controller.surfaceDisappeared() }
+        // Authoritative popover visibility for stopping the poll/motion (see bindPanelWindow);
+        // onAppear/onDisappear remain a fallback in case the window signal is unavailable.
+        .background(WindowAccessor { controller.bindPanelWindow($0) })
+        .onAppear { controller.panelAppeared() }
+        .onDisappear { controller.panelDisappeared() }
     }
 
-    // The panel body — rendered live in the ScrollView, and again (hidden) by `heightProbe`.
+    // The panel body — rendered once, live, inside the ScrollView.
     private var content: some View {
         VStack(alignment: .leading, spacing: 11) {
             header
@@ -97,8 +105,9 @@ struct PanelView: View {
     private var visualizerRow: some View {
         HStack(alignment: .top, spacing: 8) {
             VisualizerView()
-            MeterView(levelL: controller.meterL, levelR: controller.meterR,
-                      holdL: controller.peakHoldL, holdR: controller.peakHoldR)
+            // MeterView reads the controller directly so meter-rate writes invalidate ONLY
+            // the meter, not PanelView's body (which would re-walk panelHeight/NSScreen).
+            MeterView()
                 .frame(width: 62, height: 150)
         }
         .frame(maxWidth: .infinity, alignment: .center)
@@ -207,5 +216,32 @@ struct StatusChip: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - Window accessor (hands the popover's hosting NSWindow to the controller)
+
+/// Reports its hosting NSWindow whenever the view enters/leaves a window. Used to drive
+/// authoritative visibility for the MenuBarExtra(.window) popover: viewDidMoveToWindow(nil)
+/// fires on dismissal even when SwiftUI never delivers .onDisappear. All callbacks happen on
+/// the main thread (AppKit), so no cross-actor sending is involved.
+struct WindowAccessor: NSViewRepresentable {
+    let onWindow: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> WindowReportingView {
+        let v = WindowReportingView()
+        v.onWindow = onWindow
+        return v
+    }
+    func updateNSView(_ nsView: WindowReportingView, context: Context) {
+        nsView.onWindow = onWindow
+    }
+}
+
+final class WindowReportingView: NSView {
+    var onWindow: ((NSWindow?) -> Void)?
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onWindow?(window)
     }
 }

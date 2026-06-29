@@ -26,6 +26,11 @@ final class DeviceMonitor {
         registered.removeAll()
     }
 
+    // Balance the AudioObjectAddPropertyListenerBlock registrations: stop() had no callers,
+    // so the two system-global listeners outlived the monitor. (isolated deinit so the
+    // @MainActor-isolated stop() is reachable from teardown.)
+    isolated deinit { stop() }
+
     private func observe(_ selector: AudioObjectPropertySelector) {
         var addr = AudioObjectPropertyAddress(mSelector: selector,
                                               mScope: kAudioObjectPropertyScopeGlobal,

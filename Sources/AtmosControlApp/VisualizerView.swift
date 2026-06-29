@@ -5,7 +5,7 @@ import SwiftUI
 import SpatialEngine
 
 struct VisualizerView: View {
-    @EnvironmentObject var controller: EngineController
+    @Environment(EngineController.self) private var controller
 
     var body: some View {
         VStack(spacing: 5) {
@@ -30,10 +30,18 @@ struct VisualizerView: View {
 }
 
 struct RadarView: View {
-    @EnvironmentObject var controller: EngineController
+    @Environment(EngineController.self) private var controller
 
     var body: some View {
-        GeometryReader { geo in
+        // Read head-pose + source position in the BODY's observation scope. Canvas's renderer
+        // is @escaping (runs at draw time, OUTSIDE withObservationTracking), so reads inside it
+        // register NO @Observable dependency — the radar would freeze on head motion. Capture
+        // the values here and use the locals in the Canvas closure (mirrors MeterView).
+        let live = controller.headPoseLive
+        let yaw = live ? controller.headYaw : 0
+        let az = controller.config.azimuth
+        let dist = controller.config.distance
+        return GeometryReader { geo in
             let rect = CGRect(origin: .zero, size: geo.size)
             let c = CGPoint(x: rect.midX, y: rect.midY)
             let R = min(rect.width, rect.height) / 2 * 0.92
@@ -56,8 +64,6 @@ struct RadarView: View {
                 }
                 // Head + forward indicators rotate with the live head pose (world stays
                 // fixed); when no motion, yaw is 0 and they point straight up (front).
-                let live = controller.headPoseLive
-                let yaw = live ? controller.headYaw : 0
                 ctx.drawLayer { layer in
                     layer.translateBy(x: c.x, y: c.y)
                     layer.rotate(by: .radians(yaw))
@@ -83,7 +89,7 @@ struct RadarView: View {
                 }
 
                 // source dot (accent) + soft glow + ray
-                let sp = sourcePoint(c: c, R: R, az: controller.config.azimuth, distance: controller.config.distance)
+                let sp = sourcePoint(c: c, R: R, az: az, distance: dist)
                 var ray = Path(); ray.move(to: c); ray.addLine(to: sp)
                 ctx.stroke(ray, with: .color(.instrument.opacity(0.25)), lineWidth: 1)
                 let glow = Path(ellipseIn: CGRect(x: sp.x - 9, y: sp.y - 9, width: 18, height: 18))
@@ -103,8 +109,7 @@ struct RadarView: View {
                     }
             )
             .accessibilityLabel("Spatial source position")
-            .accessibilityValue(String(format: "azimuth %.0f degrees, distance %.1f meters",
-                                        controller.config.azimuth, controller.config.distance))
+            .accessibilityValue(String(format: "azimuth %.0f degrees, distance %.1f meters", az, dist))
         }
     }
 

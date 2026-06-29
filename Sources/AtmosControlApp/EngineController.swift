@@ -1,9 +1,15 @@
 // EngineController — @MainActor view-model bridging SwiftUI ↔ SpatialEngine.
 // Owns the power on/off orchestration (default-output routing) and a poll timer
-// that publishes live EngineState (peaks, 3116, ring fill) to the UI.
+// that publishes live engine telemetry (peaks, 3116, ring fill) to the UI.
+//
+// Uses the Observation framework (@Observable) rather than ObservableObject so SwiftUI
+// tracks per-property reads: a meter-rate write no longer invalidates the whole tree,
+// only the views that actually read the changed property.
 
 import SwiftUI
+import AppKit
 import CoreAudio
+import Observation
 import SpatialEngine
 
 /// How the engine captures system audio.
@@ -15,45 +21,67 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-final class EngineController: ObservableObject {
-    @Published var isOn = false
-    @Published var state = EngineState()
-    @Published var config = SpatialConfig()
-    @Published var lastError: String?
-    @Published var atmosPresent = false
-    @Published var outputName = "—"
+@Observable
+final class EngineController {
+    var isOn = false
+    var config = SpatialConfig()
+    var lastError: String?
+    var atmosPresent = false
+    var outputName = "—"
+
+    // Live engine telemetry — individual tracked properties (was one EngineState struct)
+    // so per-property observation pays off: PanelView reads only personalizedHRTFEngaged,
+    // while ringFill/totals (SettingsView-only) no longer invalidate the panel each tick.
+    var personalizedHRTFEngaged = false   // AUSpatialMixer property 3116
+    var ringFill: UInt64 = 0
+    var totalCaptured: UInt64 = 0
+    var totalPlayed: UInt64 = 0
 
     // Output routing (settings window): the discovered real sinks + the user's choice.
-    @Published var outputs: [AudioOutputDevice] = []
-    @Published var selectedOutputID: AudioDeviceID?   // nil = follow current system default
-    @Published var captureMode: CaptureMode = .processTap   // default: personalized, no black-hole
+    var outputs: [AudioOutputDevice] = []
+    var selectedOutputID: AudioDeviceID?   // nil = follow current system default
+    var captureMode: CaptureMode = .processTap   // default: personalized, no black-hole
 
     // Smoothed peak-hold for the meters (linear 0…1).
-    @Published var meterL: Float = 0
-    @Published var meterR: Float = 0
-    @Published var peakHoldL: Float = 0
-    @Published var peakHoldR: Float = 0
+    var meterL: Float = 0
+    var meterR: Float = 0
+    var peakHoldL: Float = 0
+    var peakHoldR: Float = 0
 
     // Live head pose (radians yaw) for the radar; mirrors AirPods head tracking.
-    @Published var headYaw: Double = 0
-    @Published var headPoseLive = false
+    var headYaw: Double = 0
+    var headPoseLive = false
 
-    private let engine = SpatialEngine()
-    private let deviceMonitor = DeviceMonitor()
-    private let motion = HeadphoneMotion()
-    private let tap = ProcessTap()
-    private var timer: Timer?
-    private var savedDefault: AudioDeviceID?
-    private var activeSinkID: AudioDeviceID?   // the real device the graph is rendering to
-    private var activeCaptureID: AudioDeviceID?  // tap aggregate (tap mode) or nil (loopback)
-    private var handlingChange = false
-    private var visibleSurfaces = 0            // open windows observing live state
+    @ObservationIgnored private let engine = SpatialEngine()
+    @ObservationIgnored private let deviceMonitor = DeviceMonitor()
+    @ObservationIgnored private let motion = HeadphoneMotion()
+    @ObservationIgnored private let tap = ProcessTap()
+    @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var savedDefault: AudioDeviceID?
+    @ObservationIgnored private var activeSinkID: AudioDeviceID?   // real device the graph renders to
+    @ObservationIgnored private var activeCaptureID: AudioDeviceID?  // tap aggregate (tap mode) or nil
+    @ObservationIgnored private var handlingChange = false
+
+    // Surface visibility. The MenuBarExtra(.window) popover's visibility is taken from its
+    // NSWindow (bindPanelWindow) because SwiftUI .onDisappear is not reliably delivered when
+    // that popover dismisses; the Settings Window's onAppear/onDisappear ARE reliable.
+    @ObservationIgnored private var panelOnScreen = false
+    @ObservationIgnored private var settingsOnScreen = false
+    @ObservationIgnored private weak var panelWindow: NSWindow?   // weak: don't pin the hidden popover window
+    @ObservationIgnored private var panelOcclusionObserver: NSObjectProtocol?
 
     /// The engine can run if either capture path is available. The process tap needs no
     /// driver, so the only hard requirement for loopback mode is the HAL device.
     var canRun: Bool { captureMode == .processTap || atmosPresent }
 
+    /// The live controller. Production creates exactly one (the App's @State model); the
+    /// app delegate uses this to run cleanup on quit / logout / shutdown without building a
+    /// second engine. (Preview mode's throwaway controller may overwrite it — harmless,
+    /// since preview never powers on.)
+    static weak var shared: EngineController?
+
     init() {
+        EngineController.shared = self
         atmosPresent = engine.atmosControlPresent()
         let cur = SpatialEngine.currentDefaultOutput()
         outputName = cur.name
@@ -150,12 +178,47 @@ final class EngineController: ObservableObject {
     /// Poll meters + run head-motion only while a window is actually on screen — the
     /// engine keeps spatializing when closed, but nobody's looking at the live readouts.
     /// (Counted because the panel and settings window can be open independently.)
-    func surfaceAppeared()   { visibleSurfaces += 1; updateActivity() }
-    func surfaceDisappeared() { visibleSurfaces = max(0, visibleSurfaces - 1); updateActivity() }
-    private var panelVisible: Bool { visibleSurfaces > 0 }
+    /// Panel (MenuBarExtra popover) visibility — the authoritative signal is the popover
+    /// NSWindow (see bindPanelWindow). onAppear/onDisappear are kept only as a fallback.
+    func panelAppeared()    { panelOnScreen = true;  updateActivity() }
+    func panelDisappeared() { panelOnScreen = false; updateActivity() }
+    /// Settings is a normal Window scene whose onAppear/onDisappear are reliable.
+    func settingsAppeared()    { settingsOnScreen = true;  updateActivity() }
+    func settingsDisappeared() { settingsOnScreen = false; updateActivity() }
+
+    private var anySurfaceVisible: Bool { panelOnScreen || settingsOnScreen }
+
+    /// Bind the panel popover's hosting NSWindow (handed over by WindowAccessor when the
+    /// view moves in/out of a window). Drives visibility from the window leaving the
+    /// hierarchy AND from occlusion — so polling/motion stop the instant the popover is
+    /// dismissed, even though SwiftUI does not reliably deliver .onDisappear for it.
+    func bindPanelWindow(_ window: NSWindow?) {
+        guard window !== panelWindow else { return }
+        if let obs = panelOcclusionObserver {
+            NotificationCenter.default.removeObserver(obs)
+            panelOcclusionObserver = nil
+        }
+        panelWindow = window
+        guard let window else { panelOnScreen = false; updateActivity(); return }
+        // OR so a transient not-yet-on-screen occlusion read at bind time can't clobber a
+        // `true` just set by onAppear; the observer below corrects it within a frame anyway.
+        panelOnScreen = panelOnScreen || window.occlusionState.contains(.visible)
+        panelOcclusionObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Registered for this window only; read it back on the main actor (avoids
+                // sending the non-Sendable Notification across the isolation boundary).
+                let visible = self.panelWindow?.occlusionState.contains(.visible) ?? false
+                if self.panelOnScreen != visible { self.panelOnScreen = visible; self.updateActivity() }
+            }
+        }
+        updateActivity()
+    }
 
     private func updateActivity() {
-        if isOn && panelVisible { startPolling() } else { stopPolling() }
+        if isOn && anySurfaceVisible { startPolling() } else { stopPolling() }
         syncMotion()
     }
 
@@ -164,7 +227,7 @@ final class EngineController: ObservableObject {
     /// Run head-pose updates only while on, head-tracking enabled, AND a surface visible.
     /// (Real audio head-tracking is AUSpatialMixer property 3111 — independent of this.)
     private func syncMotion() {
-        if isOn && config.headTracking && panelVisible && motion.isAvailable {
+        if isOn && config.headTracking && anySurfaceVisible && motion.isAvailable {
             motion.start()
         } else {
             motion.stop()
@@ -252,11 +315,15 @@ final class EngineController: ObservableObject {
     func powerOff() {
         engine.stop()
         if tap.isActive { tap.stop() }
-        if activeCaptureID == nil { restoreSafeDefault() } else { savedDefault = nil }  // only loopback hijacked the default
+        // Restore the system default ONLY if loopback mode actually hijacked it (savedDefault
+        // set). Idle/tap quit (no hijack) must NOT touch routing — otherwise the terminate hook
+        // would yank the user's output to speakers on every quit even if we never powered on.
+        if activeCaptureID == nil && savedDefault != nil { restoreSafeDefault() } else { savedDefault = nil }
         isOn = false
         activeSinkID = nil
         activeCaptureID = nil
-        state = EngineState()
+        personalizedHRTFEngaged = false
+        ringFill = 0; totalCaptured = 0; totalPlayed = 0
         meterL = 0; meterR = 0; peakHoldL = 0; peakHoldR = 0
         updateActivity()
     }
@@ -318,23 +385,39 @@ final class EngineController: ObservableObject {
 
     private func tick() {
         let s = engine.pollState()
-        state = s
+        // Fan the poll struct out into individual tracked properties, each guarded against
+        // no-op writes. ringFill/totalCaptured/totalPlayed change every tick during playback
+        // but are read ONLY by SettingsView, so they invalidate the panel only when it's open.
+        if personalizedHRTFEngaged != s.personalizedHRTFEngaged { personalizedHRTFEngaged = s.personalizedHRTFEngaged }
+        if ringFill != s.ringFill { ringFill = s.ringFill }
+        if totalCaptured != s.totalCaptured { totalCaptured = s.totalCaptured }
+        if totalPlayed != s.totalPlayed { totalPlayed = s.totalPlayed }
         let nm = s.outputDeviceName
         if !nm.isEmpty && nm != outputName { outputName = nm }   // guard: avoid no-op publishes
         // Meter: fast attack to the new peak, gentle release; hold the peak marker.
-        let releaseL = meterL * 0.82, releaseR = meterR * 0.82
-        meterL = max(s.peakL, releaseL)
-        meterR = max(s.peakR, releaseR)
-        peakHoldL = max(peakHoldL * 0.985, s.peakL)
-        peakHoldR = max(peakHoldR * 0.985, s.peakR)
+        // Snap sub-perceptual levels to exactly 0 and skip unchanged writes so the UI
+        // QUIESCES in silence. Otherwise *0.82 / *0.985 only underflow to 0 after tens of
+        // seconds, and every @Published write in between redraws the whole observing tree.
+        let nL = settle(max(s.peakL, meterL * 0.82))
+        let nR = settle(max(s.peakR, meterR * 0.82))
+        let hL = settle(max(peakHoldL * 0.985, s.peakL))
+        let hR = settle(max(peakHoldR * 0.985, s.peakR))
+        if nL != meterL { meterL = nL }
+        if nR != meterR { meterR = nR }
+        if hL != peakHoldL { peakHoldL = hL }
+        if hR != peakHoldR { peakHoldR = hR }
     }
+
+    /// Snap a meter level below the −60 dBFS visual floor to exactly 0 so the decay
+    /// reaches a fixed point in one tick instead of asymptotically republishing forever.
+    @inline(__always) private func settle(_ x: Float) -> Float { x < 1e-3 ? 0 : x }
 
     // MARK: Derived UI state
 
     /// Truthful personalization status given the config + live 3116.
     var hrtfStatus: (text: String, engaged: Bool) {
         if !isOn { return ("Inactive", false) }
-        if state.personalizedHRTFEngaged { return ("Personalized", true) }
+        if personalizedHRTFEngaged { return ("Personalized", true) }
         if config.outputType != .headphones { return ("Speaker virtual.", false) }
         return ("Generic HRTF", false)
     }

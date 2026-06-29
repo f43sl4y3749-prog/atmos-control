@@ -7,7 +7,7 @@ import CoreAudio
 import SpatialEngine
 
 struct SettingsView: View {
-    @EnvironmentObject var controller: EngineController
+    @Environment(EngineController.self) private var controller
 
     var body: some View {
         Form {
@@ -19,8 +19,8 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .tint(.instrument)
         .frame(minWidth: 460, idealWidth: 480, minHeight: 420, idealHeight: 620)
-        .onAppear { controller.refreshDevices(); controller.surfaceAppeared() }
-        .onDisappear { controller.surfaceDisappeared() }
+        .onAppear { controller.refreshDevices(); controller.settingsAppeared() }
+        .onDisappear { controller.settingsDisappeared() }
     }
 
     // MARK: Routing
@@ -97,12 +97,12 @@ struct SettingsView: View {
         Section("Telemetry") {
             telemetryRow("Engine", controller.isOn ? "Running" : "Stopped", on: controller.isOn)
             telemetryRow("Personalized HRTF · 3116",
-                         controller.state.personalizedHRTFEngaged ? "Engaged" : "Inactive",
-                         on: controller.state.personalizedHRTFEngaged)
+                         controller.personalizedHRTFEngaged ? "Engaged" : "Inactive",
+                         on: controller.personalizedHRTFEngaged)
             telemetryRow("Peak L / R", peakText, on: controller.isOn)
-            telemetryRow("Ring fill", "\(controller.state.ringFill) frames", on: controller.isOn)
+            telemetryRow("Ring fill", "\(controller.ringFill) frames", on: controller.isOn)
             telemetryRow("Captured / Played",
-                         "\(controller.state.totalCaptured) / \(controller.state.totalPlayed)",
+                         "\(controller.totalCaptured) / \(controller.totalPlayed)",
                          on: controller.isOn)
         }
     }

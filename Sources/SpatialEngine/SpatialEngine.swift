@@ -105,6 +105,7 @@ public final class SpatialEngine: @unchecked Sendable {
 
     private var ctx: Ctx?
     private var outputDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
+    private var startedCaptureID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)  // capture device resolved at start()
     private var cachedOutputName = ""        // device name only changes on start / sink-swap
     private var pollTick = 0                  // downsample the 3116 HAL read
     private var cached3116 = false
@@ -161,6 +162,7 @@ public final class SpatialEngine: @unchecked Sendable {
             guard let atmosID = findAtmosControlDevice() else { throw SpatialEngineError.atmosDeviceNotFound }
             captureID = atmosID
         }
+        startedCaptureID = captureID   // remember so reconfigure()'s rebuild keeps the same capture source
         let outID = try resolveOutput(requested: requested, atmosID: captureID)
         outputDeviceID = outID
         cachedOutputName = deviceName(outID)
@@ -352,9 +354,10 @@ public final class SpatialEngine: @unchecked Sendable {
             newConfig.headTracking != config.headTracking)
         if needsRebuild {
             let out = outputDeviceID
+            let cap = startedCaptureID   // preserve the capture source (tap aggregate vs loopback)
             stop()
             config = newConfig
-            try start(outputDeviceID: out)
+            try start(outputDeviceID: out, captureDeviceID: cap)
         } else {
             config = newConfig
             if let mixer = ctx?.spatialMixer { applySourceParams(mixer: mixer) }

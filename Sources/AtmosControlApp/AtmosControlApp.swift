@@ -12,12 +12,12 @@ extension Color {
 @main
 struct AtmosControlApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var controller = EngineController()
+    @State private var controller = EngineController()
 
     var body: some Scene {
         MenuBarExtra {
             PanelView()
-                .environmentObject(controller)
+                .environment(controller)
         } label: {
             Image(nsImage: GlyphCache.image(on: controller.isOn))
         }
@@ -28,7 +28,7 @@ struct AtmosControlApp: App {
         // window infinite-loops AppKit's constraint pass).
         Window("atmos-control — Settings", id: "settings") {
             SettingsView()
-                .environmentObject(controller)
+                .environment(controller)
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 480, height: 620)
@@ -39,7 +39,10 @@ struct AtmosControlApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewWindows: [NSWindow] = []
-    private let previewController = EngineController()
+    // Lazy: only the dev-only ATMOS_PREVIEW path uses it. Constructing it eagerly spun up a
+    // second EngineController at every launch — a duplicate engine + a duplicate pair of
+    // system-global CoreAudio property listeners — in the shipping (accessory) app.
+    private lazy var previewController = EngineController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let mode = ProcessInfo.processInfo.environment["ATMOS_PREVIEW"] ?? ""
@@ -49,13 +52,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Dev-only: ATMOS_PREVIEW=1|panel|settings opens the surface(s) in windows for screenshotting.
         if mode == "1" || mode == "panel" {
-            previewWindow(PanelView().environmentObject(previewController), title: "atmos-control", x: 40)
+            previewWindow(PanelView().environment(previewController), title: "atmos-control", x: 40)
         }
         if mode == "1" || mode == "settings" {
-            previewWindow(SettingsView().environmentObject(previewController), title: "Settings", x: 400,
+            previewWindow(SettingsView().environment(previewController), title: "Settings", x: 400,
                           fixedSize: NSSize(width: 480, height: 620))
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Restore the system default output + tear down capture on quit / logout / shutdown.
+        // Critical in loopback mode: otherwise the default is stranded on the virtual
+        // atmos-control sink and all system audio black-holes until manually re-selected.
+        // (terminate(_:) invokes this before exit, so the menu's Quit button is covered too.)
+        EngineController.shared?.powerOff()
     }
 
     private func previewWindow<V: View>(_ root: V, title: String, x: CGFloat, fixedSize: NSSize? = nil) {

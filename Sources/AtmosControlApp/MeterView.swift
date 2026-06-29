@@ -3,15 +3,16 @@
 import SwiftUI
 
 struct MeterView: View {
-    let levelL: Float      // linear 0…1 (smoothed)
-    let levelR: Float
-    let holdL: Float
-    let holdR: Float
+    @Environment(EngineController.self) private var controller
 
     private let floorDb: Float = -60
 
     var body: some View {
-        Canvas { ctx, size in
+        // Read the tracked values in the body's observation scope (NOT inside the Canvas
+        // closure) so a meter-rate change re-runs only this body, not PanelView's.
+        let levelL = controller.meterL, levelR = controller.meterR
+        let holdL = controller.peakHoldL, holdR = controller.peakHoldR
+        return Canvas { ctx, size in
             let top: CGFloat = 8, bot = size.height - 14, H = bot - top
             let scaleW: CGFloat = 24
             let barW: CGFloat = 13, gap: CGFloat = 6
