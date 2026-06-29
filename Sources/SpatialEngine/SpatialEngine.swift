@@ -19,6 +19,15 @@ public enum OutputType: UInt32, CaseIterable, Sendable, Identifiable {
         case .externalSpeakers: return "External Speakers"
         }
     }
+    /// Compact form for the menu-bar panel's segmented control, where the full
+    /// labels overflow the fixed 332pt width and clip past the popover edges.
+    public var shortLabel: String {
+        switch self {
+        case .headphones: return "Headphones"
+        case .builtInSpeakers: return "Built-in"
+        case .externalSpeakers: return "External"
+        }
+    }
 }
 
 public enum HRTFMode: UInt32, CaseIterable, Sendable, Identifiable {

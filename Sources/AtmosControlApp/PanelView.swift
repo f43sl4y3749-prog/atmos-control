@@ -118,7 +118,7 @@ struct PanelView: View {
     private var controls: some View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("Output type", selection: rebuildBinding(\.outputType)) {
-                ForEach(OutputType.allCases) { Text($0.label).tag($0) }
+                ForEach(OutputType.allCases) { Text($0.shortLabel).tag($0) }
             }.pickerStyle(.segmented)
 
             Picker("Personalized HRTF", selection: rebuildBinding(\.hrtfMode)) {
