@@ -43,9 +43,21 @@ let kPropPointSourceInHeadMode:         AudioUnitPropertyID = 3103  // Input, UI
 let kPropEnableHeadTracking:            AudioUnitPropertyID = 3111
 let kPropPersonalizedHRTFMode:          AudioUnitPropertyID = 3113
 let kPropAnyInputUsingPersonalizedHRTF: AudioUnitPropertyID = 3116
+let kPropReverbRoomType:                AudioUnitPropertyID = 10    // Global, UInt32 enum
+let kPropUsesInternalReverb:            AudioUnitPropertyID = 1005  // Global, UInt32 (0/1)
 
+let kSrcModeBypass:      UInt32 = 1
 let kSrcModePointSource: UInt32 = 2
 let kSrcModeAmbienceBed: UInt32 = 3
+
+// Atmos 7.1.4 canonical speaker directions (degrees), in Atmos_7_1_4 channel/bus order:
+//   L R C LFE Ls Rs Rls Rrs Vhl Vhr Ltr Rtr.
+// LFE (index 3) is rendered with SourceMode=Bypass (unspatialized). Read only on the
+// setup thread by the mixer factory + applySourceParams (never on an RT callback).
+let kAtmos714Azimuth:   [Float] = [-30, 30, 0, 0, -110, 110, -145, 145, -45, 45, -135, 135]
+let kAtmos714Elevation: [Float] = [  0,  0, 0, 0,    0,   0,    0,   0,  45, 45,   45,  45]
+let kAtmos714Channels          = 12
+let kAtmos714LFEChannel        = 3
 
 // Rendering flags (gate distance attenuation + inter-aural time delay).
 let kRenderFlagInterAuralDelay: UInt32 = 1 << 0   // 0x1
@@ -63,6 +75,8 @@ let kParamAzimuth:   AudioUnitParameterID = 0   // ±180°
 let kParamElevation: AudioUnitParameterID = 1   // ±90°
 let kParamDistance:  AudioUnitParameterID = 2   // metres
 let kParamGain:      AudioUnitParameterID = 3   // dB
+let kParamReverbBlend:      AudioUnitParameterID = 8   // Input scope, 0…100 percent
+let kParamGlobalReverbGain: AudioUnitParameterID = 9   // Global, dB
 
 // ---------------------------------------------------------------------------
 // MARK: - Lock-free SPSC ring buffer (atomic release/acquire indices)
@@ -70,23 +84,40 @@ let kParamGain:      AudioUnitParameterID = 3   // dB
 
 let kRingFrames: UInt64 = 32768       // power-of-two
 let kRingMask:   UInt64 = kRingFrames - 1
-let kRingChannels = 2
 
+/// Lock-free SPSC ring of N independent channel planes (fixed at init; never
+/// reallocated on the RT threads). Stereo capture uses N=2; surround 7.1.4 uses N=12.
 final class RingBuffer {
-    let buf0: UnsafeMutablePointer<Float>
-    let buf1: UnsafeMutablePointer<Float>
+    let channels: Int
+    // C array of `channels` plane pointers, each kRingFrames floats.
+    let planes: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
     // arm64 is weakly ordered: producer release-stores writeIdx after the buffer
     // writes; consumer acquire-loads it, so a bumped index implies visible samples.
     let writeIdx = Atomic<UInt64>(0)
     let readIdx  = Atomic<UInt64>(0)
+    // Consumer-side fill-target controller (loopback mode only — host clock vs sink
+    // clock drift). Set once on the setup thread before audio runs; the RT read()
+    // nudges the read index ±1 frame/block to hold the fill inside [driftLow, driftHigh].
+    var driftEnabled = false
+    var driftLow:  UInt64 = 0
+    var driftHigh: UInt64 = 0
 
-    init() {
-        buf0 = .allocate(capacity: Int(kRingFrames))
-        buf1 = .allocate(capacity: Int(kRingFrames))
-        buf0.initialize(repeating: 0, count: Int(kRingFrames))
-        buf1.initialize(repeating: 0, count: Int(kRingFrames))
+    init(channels: Int) {
+        self.channels = channels
+        planes = .allocate(capacity: channels)
+        var c = 0
+        while c < channels {
+            let p = UnsafeMutablePointer<Float>.allocate(capacity: Int(kRingFrames))
+            p.initialize(repeating: 0, count: Int(kRingFrames))
+            planes[c] = p
+            c &+= 1
+        }
     }
-    deinit { buf0.deallocate(); buf1.deallocate() }
+    deinit {
+        var c = 0
+        while c < channels { planes[c].deallocate(); c &+= 1 }
+        planes.deallocate()
+    }
 
     @inline(__always)
     func fill() -> UInt64 {
@@ -99,22 +130,54 @@ final class RingBuffer {
         readIdx.store(0, ordering: .relaxed)
     }
 
+    /// Prime the ring with `frames` of silence before the RT threads start, so the
+    /// first playback callbacks read primed samples instead of racing an empty ring.
+    /// Setup-thread only (no concurrent RT access).
+    func prefill(frames: UInt64) {
+        let n = frames < (kRingFrames - 1) ? frames : (kRingFrames - 1)
+        var c = 0
+        while c < channels {
+            let plane = planes[c]
+            var i: UInt64 = 0
+            while i < n { plane[Int(i)] = 0; i &+= 1 }
+            c &+= 1
+        }
+        readIdx.store(0, ordering: .relaxed)
+        writeIdx.store(n, ordering: .releasing)
+    }
+
+    // Fill-target controller (loopback only): remaining = fill after this block.
+    // Above the high water mark → discard 1 extra frame; below the low mark →
+    // re-read 1 frame next block. Single-frame nudge, raw pointer math, no alloc.
+    @inline(__always)
+    func advanceFor(available: UInt64, toRead: UInt64) -> UInt64 {
+        if driftEnabled {
+            let remaining = available &- toRead
+            if remaining > driftHigh { return toRead &+ 1 }
+            if toRead > 0 && remaining < driftLow { return toRead &- 1 }
+        }
+        return toRead
+    }
+
+    /// Producer: copy `frameCount` frames from the N non-interleaved buffers of `abl`
+    /// (abl[c].mData) into the N ring planes. Capture RT thread only.
     @inline(__always) @discardableResult
-    func write(ch0 src0: UnsafePointer<Float>, ch1 src1: UnsafePointer<Float>,
-               frameCount: UInt32) -> UInt32 {
+    func writeAll(from abl: UnsafeMutableAudioBufferListPointer, frameCount: UInt32) -> UInt32 {
         let wi = writeIdx.load(ordering: .relaxed)
         let ri = readIdx.load(ordering: .acquiring)
         let available = kRingFrames &- (wi &- ri)
         let want = UInt64(frameCount)
         let toWrite = want < available ? want : available
         if toWrite == 0 { return 0 }
-        var i: UInt64 = 0
-        while i < toWrite {
-            let slot = Int((wi &+ i) & kRingMask)
-            let si = Int(i)
-            buf0[slot] = src0[si]
-            buf1[slot] = src1[si]
-            i &+= 1
+        var c = 0
+        while c < channels {
+            if let raw = abl[c].mData {
+                let src = raw.assumingMemoryBound(to: Float.self)
+                let plane = planes[c]
+                var i: UInt64 = 0
+                while i < toWrite { plane[Int((wi &+ i) & kRingMask)] = src[Int(i)]; i &+= 1 }
+            }
+            c &+= 1
         }
         writeIdx.store(wi &+ toWrite, ordering: .releasing)
         return UInt32(toWrite)
@@ -137,8 +200,8 @@ final class RingBuffer {
         while i < toRead {
             let slot = Int((ri &+ i) & kRingMask)
             let di = Int(i)
-            dst0[di] = buf0[slot]
-            dst1[di] = buf1[slot]
+            dst0[di] = planes[0][slot]
+            dst1[di] = planes[1][slot]
             i &+= 1
         }
         if toRead < want {
@@ -146,7 +209,37 @@ final class RingBuffer {
             (dst0 + Int(toRead)).initialize(repeating: 0, count: rem)
             (dst1 + Int(toRead)).initialize(repeating: 0, count: rem)
         }
-        readIdx.store(ri &+ toRead, ordering: .releasing)
+        readIdx.store(ri &+ advanceFor(available: available, toRead: toRead), ordering: .releasing)
+        return UInt32(toRead)
+    }
+
+    /// Consumer: stage `frameCount` frames of ALL N channels into caller-provided
+    /// plane pointers `dst[0..<channels]` (surround staging). Playback RT thread only.
+    @inline(__always) @discardableResult
+    func readAll(into dst: UnsafeMutablePointer<UnsafeMutablePointer<Float>>, frameCount: UInt32) -> UInt32 {
+        let ri = readIdx.load(ordering: .relaxed)
+        let wi = writeIdx.load(ordering: .acquiring)
+        let available = wi &- ri
+        let want = UInt64(frameCount)
+        let toRead = want < available ? want : available
+        if toRead == 0 {
+            var c = 0
+            while c < channels { dst[c].initialize(repeating: 0, count: Int(frameCount)); c &+= 1 }
+            return 0
+        }
+        var c = 0
+        while c < channels {
+            let plane = planes[c]
+            let out = dst[c]
+            var i: UInt64 = 0
+            while i < toRead { out[Int(i)] = plane[Int((ri &+ i) & kRingMask)]; i &+= 1 }
+            if toRead < want {
+                let rem = Int(frameCount) - Int(toRead)
+                (out + Int(toRead)).initialize(repeating: 0, count: rem)
+            }
+            c &+= 1
+        }
+        readIdx.store(ri &+ advanceFor(available: available, toRead: toRead), ordering: .releasing)
         return UInt32(toRead)
     }
 }
@@ -156,26 +249,40 @@ final class RingBuffer {
 // ---------------------------------------------------------------------------
 
 final class Ctx: @unchecked Sendable {
-    let ring = RingBuffer()
+    let channels: Int
+    let ring: RingBuffer
     var captureUnit:  AudioUnit? = nil
     var playbackUnit: AudioUnit? = nil
     var totalCaptured: UInt64 = 0
     var totalPlayed:   UInt64 = 0
     var captureABL: UnsafeMutableAudioBufferListPointer? = nil
     var captureBufSize: UInt32 = 0
-    // Per-channel peak (max |sample|) since last poll. Written on the capture RT
-    // thread, read+reset on the main thread — aligned Float access is atomic on arm64.
-    var capturePeakL: Float = 0
-    var capturePeakR: Float = 0
+    // Per-channel peak (max |sample|) since last poll, one Float per capture channel.
+    // Written on the capture RT thread, read+reset on the main thread — aligned Float
+    // access is atomic on arm64.
+    let capturePeaks: UnsafeMutablePointer<Float>
 
     var spatialMixer:    AudioUnit? = nil
     var spatialize:      Bool = false
-    var spatialBed:      Bool = false
+    var spatialBed:      Bool = false            // stereo AmbienceBed (2ch, reads L/R)
     var spatialDualPoint: Bool = false           // two mono point-source input buses (L/R)
+    var spatialSurround:  Bool = false           // surround714: 12 mono buses staged per cycle
+    var spatialSurroundBed: Bool = false         // surroundBed714: single 12ch AmbienceBed bus
     var dmL:             UnsafeMutablePointer<Float>? = nil
     var dmR:             UnsafeMutablePointer<Float>? = nil
+    // Surround staging: `channels` planes filled once per render cycle from the ring.
+    var stage: UnsafeMutablePointer<UnsafeMutablePointer<Float>>? = nil
+    var stageChannels: Int = 0
     var spatialMaxFrames: UInt32 = 0
-    var lastStagedSampleTime: Float64 = -1        // dual-point: stage the ring once per render cycle
+    var lastStagedSampleTime: Float64 = -1        // stage the ring once per render cycle
+
+    init(channels: Int) {
+        self.channels = channels
+        ring = RingBuffer(channels: channels)
+        capturePeaks = .allocate(capacity: channels)
+        capturePeaks.initialize(repeating: 0, count: channels)
+    }
+    deinit { capturePeaks.deallocate() }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,9 +315,9 @@ func makeFloatASBD(channels: UInt32, sampleRate: Double = 48_000) -> AudioStream
     return asbd
 }
 
-func makeCaptureABL(maxFrames: UInt32) -> UnsafeMutableAudioBufferListPointer {
-    let abl = AudioBufferList.allocate(maximumBuffers: kRingChannels)
-    for ch in 0..<kRingChannels {
+func makeCaptureABL(maxFrames: UInt32, channels: Int) -> UnsafeMutableAudioBufferListPointer {
+    let abl = AudioBufferList.allocate(maximumBuffers: channels)
+    for ch in 0..<channels {
         let data = UnsafeMutableRawPointer.allocate(
             byteCount: Int(maxFrames) * MemoryLayout<Float>.size,
             alignment: MemoryLayout<Float>.alignment)
@@ -230,24 +337,30 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
     let ctx = Unmanaged<Ctx>.fromOpaque(inRefCon).takeUnretainedValue()
     guard let unit = ctx.captureUnit, let abl = ctx.captureABL else { return noErr }
     let n = inNumberFrames
-    abl[0].mDataByteSize = n * 4
-    abl[1].mDataByteSize = n * 4
+    // The ABL blocks were allocated once for captureBufSize (MaximumFramesPerSlice at
+    // setup). If the HAL delivers a larger slice mid-session (device IO buffer grown in
+    // Audio MIDI Setup / aggregate reconfig), rendering it would overflow the heap blocks.
+    if n > ctx.captureBufSize { return noErr }
+    let ch = ctx.channels
+    var b = 0
+    while b < ch { abl[b].mDataByteSize = n * 4; b &+= 1 }
     let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, n, abl.unsafeMutablePointer)
     if status != noErr { return status }
-    let src0 = abl[0].mData!.assumingMemoryBound(to: Float.self)
-    let src1 = abl[1].mData!.assumingMemoryBound(to: Float.self)
-    let written = ctx.ring.write(ch0: src0, ch1: src1, frameCount: n)
+    let written = ctx.ring.writeAll(from: abl, frameCount: n)
     ctx.totalCaptured &+= UInt64(written)
     // Per-channel peak (raw loop + fabsf — no Swift runtime calls on the RT thread).
-    var pkL: Float = 0, pkR: Float = 0
-    var i = 0; let cnt = Int(n)
-    while i < cnt {
-        let a0 = fabsf(src0[i]); if a0 > pkL { pkL = a0 }
-        let a1 = fabsf(src1[i]); if a1 > pkR { pkR = a1 }
-        i &+= 1
+    let cnt = Int(n)
+    var c = 0
+    while c < ch {
+        if let raw = abl[c].mData {
+            let src = raw.assumingMemoryBound(to: Float.self)
+            var pk: Float = 0
+            var i = 0
+            while i < cnt { let a = fabsf(src[i]); if a > pk { pk = a }; i &+= 1 }
+            if pk > ctx.capturePeaks[c] { ctx.capturePeaks[c] = pk }
+        }
+        c &+= 1
     }
-    if pkL > ctx.capturePeakL { ctx.capturePeakL = pkL }
-    if pkR > ctx.capturePeakR { ctx.capturePeakR = pkR }
     return noErr
 }
 
@@ -283,6 +396,40 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
         if let p = abl[0].mData {
             memcpy(p, src, Int(n) * 4)
             abl[0].mDataByteSize = n * 4
+        }
+        return noErr
+    }
+    if ctx.spatialSurround {
+        // surround714: 12 mono buses pulled per cycle (same timestamp). Stage all 12
+        // ring channels ONCE, then hand bus b its matching channel (bus == chan index).
+        guard let stage = ctx.stage else {
+            if let p = abl[0].mData { memset(p, 0, Int(abl[0].mDataByteSize)) }
+            return noErr
+        }
+        let st = inTimeStamp.pointee.mSampleTime
+        if st != ctx.lastStagedSampleTime {
+            ctx.ring.readAll(into: stage, frameCount: n)
+            ctx.lastStagedSampleTime = st
+        }
+        let b = Int(inBusNumber)
+        if b < ctx.stageChannels, let p = abl[0].mData {
+            memcpy(p, stage[b], Int(n) * 4)
+            abl[0].mDataByteSize = n * 4
+        }
+        return noErr
+    }
+    if ctx.spatialSurroundBed {
+        // surroundBed714: single 12ch AmbienceBed bus. Stage all channels then copy
+        // each into its non-interleaved output buffer.
+        guard let stage = ctx.stage else {
+            var b = 0; while b < nbuf { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
+            return noErr
+        }
+        ctx.ring.readAll(into: stage, frameCount: n)
+        var c = 0
+        while c < nbuf && c < ctx.stageChannels {
+            if let p = abl[c].mData { memcpy(p, stage[c], Int(n) * 4); abl[c].mDataByteSize = n * 4 }
+            c &+= 1
         }
         return noErr
     }
@@ -367,8 +514,9 @@ func setCurrentDevice(_ unit: AudioUnit, deviceID: AudioDeviceID, label: String)
           "\(label) SetCurrentDevice \(deviceID)")
 }
 
+@discardableResult
 func setStreamFormat(_ unit: AudioUnit, fmt: inout AudioStreamBasicDescription,
-                     scope: AudioUnitScope, element: AudioUnitElement, label: String) {
+                     scope: AudioUnitScope, element: AudioUnitElement, label: String) -> Bool {
     check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, scope, element,
                                &fmt, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
           "\(label) StreamFormat scope=\(scope) elem=\(element)")
@@ -394,7 +542,9 @@ func setU32(_ unit: AudioUnit, _ prop: AudioUnitPropertyID, scope: AudioUnitScop
 ///  - pointSourceMono: one mono PointSource (downmix; distance works, image collapses).
 func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: SourceRenderMode,
                       algo: UInt32, algoName: String, outputType: UInt32, outputTypeName: String,
-                      hrtfMode: UInt32, hrtfModeName: String, headTrack: UInt32) -> AudioUnit? {
+                      hrtfMode: UInt32, hrtfModeName: String, headTrack: UInt32,
+                      inputSampleRate: Double, renderFlags: UInt32, distanceParams: DistanceParams,
+                      attenCurve: UInt32, reverbEnabled: Bool, reverbRoomType: UInt32) -> AudioUnit? {
     var desc = AudioComponentDescription(
         componentType: kAudioUnitType_Mixer, componentSubType: kAudioUnitSubType_SpatialMixer,
         componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0)
@@ -404,15 +554,18 @@ func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: 
           let unit = unitOpt else { return nil }
 
     let bed       = mode.isBed
+    let surround  = mode.isSurround
     let busCount  = mode.inputBusCount
-    let chPerBus: UInt32 = bed ? 2 : 1
+    let chPerBus  = mode.channelsPerBus
     let asbdSize  = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
     let srcMode:  UInt32 = bed ? kSrcModeAmbienceBed : kSrcModePointSource
 
-    // Output is always stereo binaural.
+    // Output is always stereo binaural at 48 kHz (mismatched in/out rates SRC per bus).
     var stereoFmt = makeFloatASBD(channels: 2)
-    check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &stereoFmt, asbdSize),
-          "spatial StreamFormat Output/0 = stereo48k")
+    guard check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &stereoFmt, asbdSize),
+                "spatial StreamFormat Output/0 = stereo48k") else {
+        AudioComponentInstanceDispose(unit); return nil
+    }
 
     // Grow the input element count BEFORE configuring the extra bus.
     if busCount > 1 {
@@ -426,18 +579,26 @@ func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: 
                                &maxF, UInt32(MemoryLayout<UInt32>.size)), "spatial MaximumFramesPerSlice=\(maxFrames)")
 
     for bus in 0..<busCount {
-        var inFmt = makeFloatASBD(channels: chPerBus)
-        check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, bus, &inFmt, asbdSize),
-              "spatial StreamFormat Input/\(bus) = \(bed ? "stereo48k" : "mono48k")")
+        // surround714: the LFE channel (index 3) is rendered unspatialized (Bypass).
+        let isLFE = surround && Int(bus) == kAtmos714LFEChannel
+        let busSrcMode: UInt32 = isLFE ? kSrcModeBypass : srcMode
+        let spatializedPoint = !bed && !isLFE
+
+        var inFmt = makeFloatASBD(channels: chPerBus, sampleRate: inputSampleRate)
+        guard check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, bus, &inFmt, asbdSize),
+                    "spatial StreamFormat Input/\(bus) = \(chPerBus)ch@\(Int(inputSampleRate))") else {
+            AudioComponentInstanceDispose(unit); return nil
+        }
 
         if bed {
             var layout = AudioChannelLayout()
-            layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+            layout.mChannelLayoutTag = mode.isSurroundBed ? kAudioChannelLayoutTag_Atmos_7_1_4
+                                                          : kAudioChannelLayoutTag_Stereo
             layout.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
             layout.mNumberChannelDescriptions = 0
             check(AudioUnitSetProperty(unit, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, bus,
                                        &layout, UInt32(MemoryLayout<AudioChannelLayout>.size)),
-                  "spatial AudioChannelLayout Input/\(bus) = Stereo")
+                  "spatial AudioChannelLayout Input/\(bus) = \(mode.isSurroundBed ? "Atmos_7_1_4" : "Stereo")")
         }
 
         var inputCB = AURenderCallbackStruct(inputProc: spatialInputCallback, inputProcRefCon: ctxPtr)
@@ -448,19 +609,20 @@ func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: 
         setU32(unit, kAudioUnitProperty_SpatializationAlgorithm, scope: kAudioUnitScope_Input, element: bus,
                value: algo, label: "SpatializationAlgorithm=\(algoName)(\(algo)) [Input/\(bus)]")
         setU32(unit, kPropSourceMode, scope: kAudioUnitScope_Input, element: bus,
-               value: srcMode, label: "SourceMode=\(bed ? "AmbienceBed" : "PointSource")(\(srcMode)) [3005/Input/\(bus)]")
+               value: busSrcMode, label: "SourceMode=\(busSrcMode) [3005/Input/\(bus)]")
 
-        // Distance attenuation + externalization only matter for point sources (no-op for a far-field bed).
-        if !bed {
+        // Distance attenuation + externalization only matter for spatialized point sources
+        // (no-op for a far-field bed or the bypassed LFE).
+        if spatializedPoint {
             setU32(unit, kPropRenderingFlags, scope: kAudioUnitScope_Input, element: bus,
-                   value: kRenderFlagInterAuralDelay | kRenderFlagDistanceAtten,
-                   label: "RenderingFlags=ITD|DistanceAtten(0x5) [3003/Input/\(bus)]")
-            var dp = DistanceParams(referenceDistance: 0.3, maxDistance: 6.0, maxAttenuation: 40.0)
+                   value: renderFlags,
+                   label: "RenderingFlags=0x\(String(renderFlags, radix: 16)) [3003/Input/\(bus)]")
+            var dp = distanceParams
             check(AudioUnitSetProperty(unit, kPropDistanceParams, kAudioUnitScope_Input, bus,
                                        &dp, UInt32(MemoryLayout<DistanceParams>.size)),
-                  "DistanceParams ref=0.3 max=6 atten=40dB [3010/Input/\(bus)]")
+                  "DistanceParams ref=\(dp.referenceDistance) max=\(dp.maxDistance) atten=\(dp.maxAttenuation)dB [3010/Input/\(bus)]")
             setU32(unit, kPropAttenuationCurve, scope: kAudioUnitScope_Input, element: bus,
-                   value: kAttenuationCurveInverse, label: "AttenuationCurve=Inverse [3013/Input/\(bus)]")
+                   value: attenCurve, label: "AttenuationCurve=\(attenCurve) [3013/Input/\(bus)]")
             setU32(unit, kPropPointSourceInHeadMode, scope: kAudioUnitScope_Input, element: bus,
                    value: kInHeadModeBypass, label: "PointSourceInHeadMode=Bypass [3103/Input/\(bus)]")
         }
@@ -481,6 +643,16 @@ func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: 
            value: headTrack, label: "EnableHeadTracking=\(headTrack) [3111/Global]")
     setU32(unit, kPropPersonalizedHRTFMode, scope: kAudioUnitScope_Global, element: 0,
            value: hrtfMode, label: "PersonalizedHRTFMode=\(hrtfModeName)(\(hrtfMode)) [3113/Global]")
+
+    // Internal reverb wet path is inert under kSpatializationAlgorithm_UseOutputType
+    // (and would only attenuate the dry path), so the engine gates this OFF there.
+    // ReverbBlend / GlobalReverbGain are pushed AFTER initialize (see applyReverbParams).
+    if reverbEnabled {
+        setU32(unit, kPropUsesInternalReverb, scope: kAudioUnitScope_Global, element: 0,
+               value: 1, label: "UsesInternalReverb=1 [1005/Global]")
+        setU32(unit, kPropReverbRoomType, scope: kAudioUnitScope_Global, element: 0,
+               value: reverbRoomType, label: "ReverbRoomType=\(reverbRoomType) [10/Global]")
+    }
 
     guard check(AudioUnitInitialize(unit), "spatial AudioUnitInitialize") else {
         AudioComponentInstanceDispose(unit); return nil

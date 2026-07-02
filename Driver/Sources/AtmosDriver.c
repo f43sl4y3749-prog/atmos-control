@@ -11,8 +11,8 @@
  *           ├─ Input  stream  (kObjectID_Stream_Input  = 3)
  *           └─ Output stream  (kObjectID_Stream_Output = 4)
  *
- * Format: 32-bit float, 48 kHz, 2 channels (stereo interleaved).
- * Ring buffer: 65536 frames × 2ch × 4 bytes = 512 KiB (power-of-2, > 10923 minimum).
+ * Format: 32-bit float, 48 kHz, 12 channels (7.1.4 interleaved, Atmos_7_1_4 layout).
+ * Ring buffer: 65536 frames × 12ch × 4 bytes = 3 MiB (power-of-2, > 10923 minimum).
  */
 
 #include <CoreAudio/AudioServerPlugIn.h>
@@ -34,7 +34,7 @@
 #define kDevice_Manufacturer     "atmos-control"
 
 #define kDevice_SampleRate       48000.0
-#define kDevice_ChannelsPerFrame 2u
+#define kDevice_ChannelsPerFrame 12u                                   /* 7.1.4 (Atmos_7_1_4) */
 #define kDevice_BytesPerChannel  4u                                    /* sizeof(Float32) */
 #define kDevice_BytesPerFrame    (kDevice_ChannelsPerFrame * kDevice_BytesPerChannel)
 
@@ -61,7 +61,7 @@ static AudioServerPlugInHostRef gHost = NULL;
 /* IO ref-count: IO is live while this is > 0 */
 static uint32_t gIORunCount = 0;
 
-/* Loopback ring buffer: float32 interleaved stereo */
+/* Loopback ring buffer: float32 interleaved 7.1.4 (12ch) */
 static Float32  gRingBuffer[kDevice_RingBufferSamples];
 
 /* Zero-timestamp anchor (guarded by gStateMutex) */
@@ -689,7 +689,7 @@ static OSStatus AtmosDriver_GetPropertyData(AudioServerPlugInDriverRef        in
                 UInt32 sz = (UInt32)offsetof(AudioChannelLayout, mChannelDescriptions[0]);
                 NEED(sz);
                 AudioChannelLayout *l = (AudioChannelLayout *)outData;
-                l->mChannelLayoutTag          = kAudioChannelLayoutTag_Stereo;
+                l->mChannelLayoutTag          = kAudioChannelLayoutTag_Atmos_7_1_4;
                 l->mChannelBitmap             = 0;
                 l->mNumberChannelDescriptions = 0;
                 *outDataSize = sz;

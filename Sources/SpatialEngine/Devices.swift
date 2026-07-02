@@ -40,22 +40,51 @@ func deviceName(_ id: AudioDeviceID) -> String {
 }
 
 func deviceHasChannels(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Bool {
+    deviceChannelCount(id, scope: scope) > 0
+}
+
+/// Total channel count across all streams on `scope` (0 = none / unreadable). Used to tell
+/// the 12-channel surround loopback driver apart from the legacy stereo one.
+func deviceChannelCount(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioDevicePropertyStreamConfiguration, mScope: scope, mElement: kAudioObjectPropertyElementMain)
     var dataSize: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &dataSize) == noErr, dataSize > 0 else { return false }
+    guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &dataSize) == noErr, dataSize > 0 else { return 0 }
     let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(dataSize),
                                                alignment: MemoryLayout<AudioBufferList>.alignment)
     defer { raw.deallocate() }
     var sz = dataSize
-    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, raw) == noErr else { return false }
-    return raw.bindMemory(to: AudioBufferList.self, capacity: 1).pointee.mNumberBuffers > 0
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, raw) == noErr else { return 0 }
+    let abl = UnsafeMutableAudioBufferListPointer(raw.bindMemory(to: AudioBufferList.self, capacity: 1))
+    var total = 0
+    for buf in abl { total += Int(buf.mNumberChannels) }
+    return total
 }
 
 func findAtmosControlDevice() -> AudioDeviceID? {
     for id in allDeviceIDs() where deviceUID(id) == kAtmosControlUID { return id }
     for id in allDeviceIDs() where deviceName(id).lowercased().contains("atmos-control") { return id }
     return nil
+}
+
+func deviceNominalSampleRate(_ id: AudioDeviceID) -> Double? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var rate: Float64 = 0
+    var sz = UInt32(MemoryLayout<Float64>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &rate) == noErr, rate > 0 else { return nil }
+    return rate
+}
+
+func deviceBufferFrameSize(_ id: AudioDeviceID) -> UInt32 {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyBufferFrameSize,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var frames: UInt32 = 512
+    var sz = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &frames) == noErr, frames > 0 else { return 512 }
+    return frames
 }
 
 func defaultOutputDeviceID(system: Bool = false) -> AudioDeviceID {

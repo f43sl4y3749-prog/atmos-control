@@ -4,11 +4,16 @@
 //
 // Env:
 //   SPATIALIZE=0|1   insert the spatial mixer (default 1; 0 = direct passthrough)
-//   SRC_MODE=dual|bed|point   dual PointSource L/R (default) | stereo AmbienceBed | mono PointSource
+//   SRC_MODE=dual|bed|point|surround|surroundbed   dual PointSource L/R (default) |
+//            stereo AmbienceBed | mono PointSource | 7.1.4 12-bus points | 7.1.4 AmbienceBed
 //   OUTPUT_TYPE=headphones|builtin|external
 //   HRTF_MODE=auto|on|off    PersonalizedHRTFMode
 //   ALGO=useoutputtype|hrtf|hrtfhq
 //   HEAD_TRACK=0|1   EnableHeadTracking (default 1)
+//   DIST_ATTEN=0|1   distance-attenuate loudness (default 0 = distance-invariant)
+//   REVERB=0|1       internal reverb (default 1; only audible under ALGO=hrtf/hrtfhq)
+//   REVERB_BLEND=<0..100>   reverb wet/dry blend percent (default 20)
+//   ROOM=small|medium|large ReverbRoomType (default medium)
 //   OUTPUT_DEVICE=<substr>   real output device (default: AirPods, else default output)
 //   RUN_SECONDS=N    auto-stop after N seconds (0/unset = until Ctrl-C)
 
@@ -29,9 +34,11 @@ func envFlag(_ k: String, default def: Bool) -> Bool {
 var cfg = SpatialConfig()
 cfg.spatialize = envFlag("SPATIALIZE", default: true)
 switch env("SRC_MODE")?.lowercased() {
-case "bed":   cfg.sourceMode = .ambienceBedStereo
-case "point": cfg.sourceMode = .pointSourceMono
-default:      cfg.sourceMode = .dualPointStereo
+case "bed":        cfg.sourceMode = .ambienceBedStereo
+case "point":      cfg.sourceMode = .pointSourceMono
+case "surround":   cfg.sourceMode = .surround714
+case "surroundbed": cfg.sourceMode = .surroundBed714
+default:           cfg.sourceMode = .dualPointStereo
 }
 switch env("OUTPUT_TYPE")?.lowercased() {
 case "builtin":  cfg.outputType = .builtInSpeakers
@@ -49,6 +56,15 @@ case "hrtfhq": cfg.algorithm = .hrtfHQ
 default:       cfg.algorithm = .useOutputType
 }
 cfg.headTracking = envFlag("HEAD_TRACK", default: true)
+cfg.distanceAttenuation = envFlag("DIST_ATTEN", default: false)
+cfg.reverbEnabled = envFlag("REVERB", default: true)
+if let b = env("REVERB_BLEND").flatMap({ Float($0) }) { cfg.reverbBlend = b }
+switch env("ROOM")?.lowercased() {
+case "small": cfg.reverbRoomType = .small
+case "large": cfg.reverbRoomType = .large
+case "medium": cfg.reverbRoomType = .medium
+default: break
+}
 
 let engine = SpatialEngine()
 engine.logger = { print($0) }

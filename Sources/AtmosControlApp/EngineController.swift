@@ -29,6 +29,18 @@ final class EngineController {
     var atmosPresent = false
     var outputName = "—"
 
+    /// True when the tap start failed on (likely) audio-capture consent. We surface an
+    /// explicit permission state and do NOT auto-fall-back to loopback (which would mutate
+    /// the system default output). Cleared on a successful start / mode switch / retry.
+    var permissionNeeded = false
+
+    /// The installed loopback exposes the full 12-channel 7.1.4 surface (enables Surround).
+    var surroundDriverInstalled = false
+
+    /// Per-capture-channel peaks (Atmos_7_1_4 order) for the settings Levels surround meter;
+    /// [L,R] in stereo modes. Read only by SettingsView when surround is active.
+    var channelPeaks: [Float] = []
+
     // Live engine telemetry — individual tracked properties (was one EngineState struct)
     // so per-property observation pays off: PanelView reads only personalizedHRTFEngaged,
     // while ringFill/totals (SettingsView-only) no longer invalidate the panel each tick.
@@ -70,9 +82,45 @@ final class EngineController {
     @ObservationIgnored private weak var panelWindow: NSWindow?   // weak: don't pin the hidden popover window
     @ObservationIgnored private var panelOcclusionObserver: NSObjectProtocol?
 
-    /// The engine can run if either capture path is available. The process tap needs no
-    /// driver, so the only hard requirement for loopback mode is the HAL device.
-    var canRun: Bool { captureMode == .processTap || atmosPresent }
+    /// The engine can run for the CURRENT capture choice. Personalized (tap) needs no driver;
+    /// the virtual-device options need the HAL device (Surround needs the 12-channel variant).
+    /// The panel never collapses on this — a false value only disables the power toggle and
+    /// shows an inline notice (F11).
+    var canRun: Bool {
+        switch captureChoice {
+        case .personalized:  return true
+        case .virtualStereo: return atmosPresent
+        case .surround:      return surroundDriverInstalled
+        }
+    }
+
+    /// The user-facing capture choice derived from the engine's capture mode + source mode.
+    var captureChoice: CaptureChoice {
+        if captureMode == .processTap { return .personalized }
+        return (config.sourceMode == .surround714 || config.sourceMode == .surroundBed714) ? .surround : .virtualStereo
+    }
+
+    /// Switch the user-facing capture choice (maps onto CaptureMode + SourceRenderMode).
+    /// Restarts the engine if it was running.
+    func setCaptureChoice(_ choice: CaptureChoice) {
+        guard choice != captureChoice else { return }
+        permissionNeeded = false
+        let wasOn = isOn
+        if wasOn { powerOff() }
+        switch choice {
+        case .personalized:
+            captureMode = .processTap
+            if config.sourceMode == .surround714 || config.sourceMode == .surroundBed714 { config.sourceMode = .dualPointStereo }
+        case .virtualStereo:
+            captureMode = .loopbackDriver
+            if config.sourceMode == .surround714 || config.sourceMode == .surroundBed714 { config.sourceMode = .dualPointStereo }
+        case .surround:
+            captureMode = .loopbackDriver
+            config.sourceMode = .surround714
+        }
+        engine.config = config
+        if wasOn { powerOn() }
+    }
 
     /// The live controller. Production creates exactly one (the App's @State model); the
     /// app delegate uses this to run cleanup on quit / logout / shutdown without building a
@@ -83,6 +131,7 @@ final class EngineController {
     init() {
         EngineController.shared = self
         atmosPresent = engine.atmosControlPresent()
+        surroundDriverInstalled = engine.surroundDriverInstalled()
         let cur = SpatialEngine.currentDefaultOutput()
         outputName = cur.name
         outputs = engine.outputDevices()
@@ -94,6 +143,20 @@ final class EngineController {
         }
         deviceMonitor.onChange = { [weak self] in self?.handleDeviceChange() }
         deviceMonitor.start()
+
+        // The capture device renegotiated its sample rate and the engine rebuilt the graph.
+        // ok == false means the rebuild failed and the engine is stopped: we MUST power off
+        // so the muting process tap is torn down (otherwise all system audio stays silenced).
+        engine.onFormatChange = { [weak self] ok in
+            guard let self else { return }
+            if ok {
+                self.lastError = nil
+                self.updateActivity()
+            } else {
+                self.lastError = "Audio format changed and the engine could not restart — stopped."
+                self.powerOff()
+            }
+        }
     }
 
     // MARK: Output devices
@@ -101,6 +164,7 @@ final class EngineController {
     /// Re-enumerate the available real sinks; drop a selection that has vanished.
     func refreshDevices() {
         atmosPresent = engine.atmosControlPresent()
+        surroundDriverInstalled = engine.surroundDriverInstalled()
         outputs = engine.outputDevices()
         if let sel = selectedOutputID, !outputs.contains(where: { $0.id == sel }) {
             selectedOutputID = nil
@@ -135,6 +199,7 @@ final class EngineController {
         defer { handlingChange = false }
 
         atmosPresent = engine.atmosControlPresent()
+        surroundDriverInstalled = engine.surroundDriverInstalled()
         let devices = engine.outputDevices()
         outputs = devices
         if let sel = selectedOutputID, !devices.contains(where: { $0.id == sel }) { selectedOutputID = nil }
@@ -242,13 +307,33 @@ final class EngineController {
 
     func powerOn() {
         atmosPresent = engine.atmosControlPresent()
-        if captureMode == .processTap, startTapMode() { return }
-        startLoopbackMode()   // explicit loopback, or process-tap fell back
+        surroundDriverInstalled = engine.surroundDriverInstalled()
+        permissionNeeded = false
+        if captureMode == .processTap { startTapMode(); return }
+        startLoopbackMode()   // explicit virtual-device (loopback) mode — never an auto-fallback
+    }
+
+    /// Deep-link into System Settings ▸ Privacy so the user can grant audio-capture consent.
+    func openPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Explicit, user-initiated retry after a permission failure (does NOT change routing).
+    func retryCapture() { permissionNeeded = false; powerOn() }
+
+    /// Explicit, user-initiated switch to the virtual-device path (this one DOES change the
+    /// default output — so it only happens on a deliberate tap, never as a silent fallback).
+    func switchToVirtualDevice() {
+        permissionNeeded = false
+        setCaptureChoice(.virtualStereo)
+        if !isOn { powerOn() }
     }
 
     /// Personalized capture via a muting process tap. AirPods stay the default output so
     /// property 3116 engages; we never hijack the default → no black-hole, nothing to restore.
-    private func startTapMode() -> Bool {
+    private func startTapMode() {
         let devices = engine.outputDevices()
         outputs = devices
         let current = SpatialEngine.currentDefaultOutput()
@@ -267,12 +352,20 @@ final class EngineController {
             savedDefault = nil
             isOn = true
             lastError = nil
+            permissionNeeded = false
             updateActivity()
-            return true
         } catch {
             tap.stop()
-            lastError = "Personalized capture unavailable (\(error)) — using loopback."
-            return false
+            // Distinguish a (likely) consent denial from any other tap failure. Tap CREATION
+            // failing is overwhelmingly the audio-capture TCC gate; aggregate/UID failures are
+            // infrastructure errors. Never auto-fall-back to loopback (that mutates routing).
+            if let e = error as? ProcessTapError, case .createTapFailed = e {
+                permissionNeeded = true
+                lastError = nil
+            } else {
+                permissionNeeded = false
+                lastError = "Personalized capture unavailable: \(error)."
+            }
         }
     }
 
@@ -325,6 +418,7 @@ final class EngineController {
         personalizedHRTFEngaged = false
         ringFill = 0; totalCaptured = 0; totalPlayed = 0
         meterL = 0; meterR = 0; peakHoldL = 0; peakHoldR = 0
+        if !channelPeaks.isEmpty { channelPeaks = [] }
         updateActivity()
     }
 
@@ -360,13 +454,44 @@ final class EngineController {
         catch { lastError = "\(error)"; powerOff() }
     }
 
-    /// Live source position/gain (no rebuild).
-    func setSource(azimuth: Float? = nil, elevation: Float? = nil, distance: Float? = nil, gain: Float? = nil) {
+    /// Live source position/gain/width (no rebuild).
+    func setSource(azimuth: Float? = nil, elevation: Float? = nil, distance: Float? = nil,
+                   gain: Float? = nil, width: Float? = nil) {
         if let a = azimuth { config.azimuth = a }
         if let e = elevation { config.elevation = e }
         if let d = distance { config.distance = d }
         if let g = gain { config.gain = g }
-        engine.updateSource(azimuth: azimuth, elevation: elevation, distance: distance, gain: gain)
+        if let w = width { config.stereoWidth = w }
+        engine.updateSource(azimuth: azimuth, elevation: elevation, distance: distance, gain: gain, width: width)
+    }
+
+    /// Live reverb wet/dry blend (no rebuild; no-op in the engine unless the reverb path is
+    /// active, i.e. HRTF / HRTF-HQ).
+    func setReverbBlend(_ v: Float) {
+        config.reverbBlend = v
+        engine.updateReverb(blend: v)
+    }
+
+    /// Reset the soundstage to the front-and-centre default (F13 / amendment B).
+    func resetSoundstage() {
+        setSource(azimuth: 0, elevation: 0, distance: Float(Param.distance.def),
+                  gain: 0, width: Float(Param.width.def))
+    }
+
+    /// Reset the advanced rendering block to its defaults (amendment B).
+    func resetRendering() {
+        config.interauralDelay = true
+        config.distanceAttenuation = false
+        config.attenuationCurve = .inverse
+        config.distanceRef = Float(Param.distanceRef.def)
+        config.distanceMax = Float(Param.distanceMax.def)
+        config.distanceMaxAtten = Float(Param.distanceAtten.def)
+        config.reverbEnabled = true
+        config.reverbRoomType = .medium
+        config.reverbBlend = Float(Param.reverbBlend.def)
+        config.globalReverbGain = Float(Param.reverbGain.def)
+        config.algorithm = .useOutputType
+        applyConfig()
     }
 
     // MARK: Polling
@@ -389,6 +514,13 @@ final class EngineController {
         // no-op writes. ringFill/totalCaptured/totalPlayed change every tick during playback
         // but are read ONLY by SettingsView, so they invalidate the panel only when it's open.
         if personalizedHRTFEngaged != s.personalizedHRTFEngaged { personalizedHRTFEngaged = s.personalizedHRTFEngaged }
+        // Surround Levels meter (settings only): publish the full per-channel peak vector when
+        // in a 12-channel mode, else keep it empty so stereo modes never carry the extra array.
+        if s.peaks.count > 2 {
+            if channelPeaks != s.peaks { channelPeaks = s.peaks }
+        } else if !channelPeaks.isEmpty {
+            channelPeaks = []
+        }
         if ringFill != s.ringFill { ringFill = s.ringFill }
         if totalCaptured != s.totalCaptured { totalCaptured = s.totalCaptured }
         if totalPlayed != s.totalPlayed { totalPlayed = s.totalPlayed }
@@ -414,12 +546,58 @@ final class EngineController {
 
     // MARK: Derived UI state
 
-    /// Truthful personalization status given the config + live 3116.
-    var hrtfStatus: (text: String, engaged: Bool) {
-        if !isOn { return ("Inactive", false) }
-        if personalizedHRTFEngaged { return ("Personalized", true) }
-        if config.outputType != .headphones { return ("Speaker virtual.", false) }
-        return ("Generic HRTF", false)
+    /// Single truthful personalization status (spec §1): a chip short-form, a settings long-form
+    /// with a plain-language reason, and whether the accent "engaged" treatment applies.
+    struct HRTFStatus { let short: String; let long: String; let engaged: Bool }
+
+    var hrtfStatus: HRTFStatus {
+        if !isOn { return HRTFStatus(short: "—", long: "Inactive — engine off", engaged: false) }
+        if personalizedHRTFEngaged {
+            return HRTFStatus(short: "Personalized", long: "Personalized — Apple profile active", engaged: true)
+        }
+        if captureMode == .loopbackDriver {
+            return HRTFStatus(short: "Generic", long: "Generic — virtual-device output can’t carry a personalized profile", engaged: false)
+        }
+        if config.outputType != .headphones {
+            return HRTFStatus(short: "Generic", long: "Generic — personalized applies to headphones only", engaged: false)
+        }
+        if config.algorithm != .useOutputType {
+            return HRTFStatus(short: "Generic", long: "Generic — personalized needs the Automatic algorithm", engaged: false)
+        }
+        return HRTFStatus(short: "Generic", long: "Generic — set AirPods with an Apple personalized profile as the system output", engaged: false)
+    }
+
+    /// Head-tracking status (F14): Off (disabled) · Idle (enabled, not tracking) · Tracking
+    /// (enabled, engine running AND live pose). Never claim "Tracking" without live pose.
+    var headTrackStatus: String {
+        guard config.headTracking else { return "Off" }
+        return (isOn && headPoseLive) ? "Tracking" : "Idle"
+    }
+    var headTrackActive: Bool { config.headTracking && isOn && headPoseLive }
+
+    /// True when personalized HRTF (property 3116) can never engage in the current config, so
+    /// the HRTF-mode picker should be disabled with a reason (F4).
+    var personalizationDisabledReason: String? {
+        if captureMode == .loopbackDriver { return "Unavailable with the virtual device." }
+        if config.outputType != .headphones { return "Personalized applies to headphones only." }
+        if config.algorithm != .useOutputType { return "Needs the Automatic algorithm." }
+        return nil
+    }
+
+    /// Advisory about Apple Music's Dolby Atmos setting (r4/t4). Only while running; never
+    /// written back. In personalized/stereo the ideal is Off; in surround it is Automatic.
+    var musicAtmosAdvisory: String? {
+        guard isOn else { return nil }
+        guard let raw = CFPreferencesCopyAppValue("preferredDolbyAtmosPlaySetting" as CFString,
+                                                  "com.apple.Music" as CFString) else { return nil }
+        let setting = (raw as? NSNumber)?.intValue ?? -1   // 10=Automatic 20=Always On 30=Off
+        if captureChoice == .surround {
+            return setting == 10 ? nil : "For true multichannel, set Music ▸ Settings ▸ Playback ▸ Dolby Atmos to Automatic."
+        }
+        if captureMode == .processTap {
+            return setting == 30 ? nil : "For best results set Music ▸ Settings ▸ Playback ▸ Dolby Atmos to Off."
+        }
+        return nil
     }
 }
 

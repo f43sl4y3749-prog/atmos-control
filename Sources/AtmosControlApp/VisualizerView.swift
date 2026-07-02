@@ -19,13 +19,16 @@ struct VisualizerView: View {
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
         }
     }
 
+    // Exactly three values on one line (DESIGN.md hero readout). Gain is dropped here — it's
+    // shown live by its own slider row — so the line never reflows onto two rows.
     private var readout: String {
         let c = controller.config
-        return String(format: "az %+.0f°  el %+.0f°  %.2f m  %+.0f dB",
-                      c.azimuth, c.elevation, c.distance, c.gain)
+        return String(format: "az %+.0f° · el %+.0f° · %.2f m", c.azimuth, c.elevation, c.distance)
     }
 }
 
@@ -69,12 +72,13 @@ struct RadarView: View {
                     layer.rotate(by: .radians(yaw))
                     layer.translateBy(x: -c.x, y: -c.y)
 
-                    // front chevron (accent) at the head's forward, just outside the ring
+                    // Front chevron: part of the neutral grid scaffold (matches the azimuth
+                    // ticks) — the accent stays reserved for the live source dot only.
                     var chev = Path()
                     chev.move(to: CGPoint(x: c.x - 5, y: c.y - R - 1))
                     chev.addLine(to: CGPoint(x: c.x, y: c.y - R + 5))
                     chev.addLine(to: CGPoint(x: c.x + 5, y: c.y - R - 1))
-                    layer.stroke(chev, with: .color(.instrument),
+                    layer.stroke(chev, with: .color(grid.opacity(0.5)),
                                  style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
 
                     // listener head + nose pointing forward
@@ -104,8 +108,10 @@ struct RadarView: View {
                         let dx = v.location.x - c.x, dy = v.location.y - c.y
                         let az = atan2(dx, -dy) * 180 / .pi
                         let rho = min(hypot(dx, dy), R)
-                        let dist = Float(rho / R) * 3
-                        controller.setSource(azimuth: Float(az), distance: max(0.1, dist))
+                        let dist = Float(rho / R) * Float(Param.distance.range.upperBound)   // 6 m ceiling
+                        controller.setSource(azimuth: Float(az),
+                                             distance: min(max(dist, Float(Param.distance.range.lowerBound)),
+                                                           Float(Param.distance.range.upperBound)))
                     }
             )
             .accessibilityLabel("Spatial source position")
@@ -114,7 +120,8 @@ struct RadarView: View {
     }
 
     private func sourcePoint(c: CGPoint, R: CGFloat, az: Float, distance: Float) -> CGPoint {
-        let rho = CGFloat(min(max(distance / 3, 0.06), 1)) * R
+        let ceil = Float(Param.distance.range.upperBound)   // 6 m maps to the outer ring
+        let rho = CGFloat(min(max(distance / ceil, 0.06), 1)) * R
         let a = Double(az) * .pi / 180
         return CGPoint(x: c.x + rho * sin(a), y: c.y - rho * cos(a))
     }

@@ -1,5 +1,6 @@
 // PanelView — the compact menu-bar panel. Power + truthful status + the spatial
-// visualizer + meters + quick controls. Apple-native restraint.
+// visualizer + meters + the two sanctioned quick actions. Apple-native restraint.
+// No raw per-source sliders and no HRTF-mode picker — those live in Settings.
 
 import SwiftUI
 import AppKit
@@ -13,16 +14,17 @@ struct PanelView: View {
     /// (already excludes menu bar + Dock), leaving a little breathing room.
     private var maxPanelHeight: CGFloat { (NSScreen.main?.visibleFrame.height ?? 900) - 24 }
 
-    /// Deterministic per-state height — no measure⇄resize loop and (crucially) no second
-    /// render pass. Clamped to the screen; the ScrollView absorbs any residual overflow.
-    /// MUST key off the SAME predicate the content branch uses (`canRun`, see `content`):
-    /// keying on `atmosPresent` pinned the full ~545pt surface into a 180pt frame in the
-    /// default process-tap / no-driver state (atmosPresent == false but canRun == true),
-    /// so the popover opened clipped at 332×180 — and forced AppKit to reconcile a
-    /// 180-vs-545 frame/content mismatch every layout pass.
+    /// Deterministic per-state height — no measure⇄resize loop and no second render pass
+    /// (a MenuBarExtra(.window) landmine). Each optional inline row adds a fixed amount; the
+    /// ScrollView absorbs any residual overflow. The panel NEVER collapses (F11): a mode that
+    /// can't run shows an inline notice, not a stripped-down surface.
     private var panelHeight: CGFloat {
-        guard controller.canRun else { return min(180, maxPanelHeight) }   // compact "driver missing" surface
-        return min(545 + (controller.lastError != nil ? 30 : 0), maxPanelHeight)
+        var h: CGFloat = 430
+        if controller.permissionNeeded { h += 78 }
+        if runNotice != nil { h += 46 }
+        if controller.musicAtmosAdvisory != nil { h += 30 }
+        if controller.lastError != nil { h += 30 }
+        return min(h, maxPanelHeight)
     }
 
     var body: some View {
@@ -46,17 +48,17 @@ struct PanelView: View {
             header
             Divider()
 
-            if !controller.canRun {
-                driverMissing
-            } else {
-                statusStrip
-                visualizerRow
-                Divider()
-                controls
-            }
+            statusStrip
+            visualizerRow
+            Divider()
+            controls
 
+            if controller.permissionNeeded { permissionNotice }
+            if let notice = runNotice { runNoticeRow(notice) }
+            if let hint = controller.musicAtmosAdvisory { advisoryRow(hint) }
             if let err = controller.lastError {
-                Text(err).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                Text(err).font(.system(size: 11)).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
@@ -94,10 +96,17 @@ struct PanelView: View {
             }
             HStack(spacing: 14) {
                 StatusChip(icon: hrtf.engaged ? "person.fill.viewfinder" : "person.crop.circle",
-                           label: "HRTF", value: hrtf.text, active: hrtf.engaged)
+                           label: "Personalized", value: hrtf.short, active: hrtf.engaged,
+                           trailing: {
+                               Button { openSettings() } label: {
+                                   Image(systemName: "questionmark.circle").font(.system(size: 10))
+                               }
+                               .buttonStyle(.borderless)
+                               .foregroundStyle(.secondary)
+                               .help("Why? Open Personalization settings")
+                           })
                 StatusChip(icon: "gyroscope", label: "Head track",
-                           value: controller.config.headTracking ? (controller.isOn ? "Active" : "On") : "Off",
-                           active: controller.config.headTracking && controller.isOn)
+                           value: controller.headTrackStatus, active: controller.headTrackActive)
             }
         }
     }
@@ -113,50 +122,89 @@ struct PanelView: View {
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
-    // MARK: Controls
+    // MARK: Controls — only the two sanctioned quick actions
 
     private var controls: some View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("Output type", selection: rebuildBinding(\.outputType)) {
                 ForEach(OutputType.allCases) { Text($0.shortLabel).tag($0) }
-            }.pickerStyle(.segmented)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
-            Picker("Personalized HRTF", selection: rebuildBinding(\.hrtfMode)) {
-                ForEach(HRTFMode.allCases) { Text($0.label).tag($0) }
-            }.pickerStyle(.segmented)
-
-            Toggle("Head tracking", isOn: rebuildBinding(\.headTracking))
-
-            sliderRow("Elevation", value: liveBinding(\.elevation, apply: { controller.setSource(elevation: $0) }),
-                      range: -90...90, unit: "°")
-            sliderRow("Gain", value: liveBinding(\.gain, apply: { controller.setSource(gain: $0) }),
-                      range: -20...6, unit: "dB")
+            HStack(spacing: 8) {
+                Toggle("Head tracking", isOn: rebuildBinding(\.headTracking))
+                    .toggleStyle(.switch)
+                    .fixedSize()
+                Spacer(minLength: 8)
+                // Quiet text action — mirrors Settings' "Reset soundstage" (same call, same
+                // disabled condition). Borderless, caption-scale, secondary: no accent fill.
+                Button("Reset") { controller.resetSoundstage() }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .disabled(!controller.config.spatialize)
+                    .help("Reset the soundstage to front-and-centre")
+            }
         }
         .font(.system(size: 12))
     }
 
-    private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, unit: String) -> some View {
-        HStack(spacing: 8) {
-            Text(label).frame(width: 64, alignment: .leading)
-            Slider(value: value, in: range)
-            Text(String(format: "%+.0f%@", value.wrappedValue, unit))
-                .font(.system(size: 11, design: .monospaced)).monospacedDigit()
-                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+    // MARK: Inline notices
+
+    /// A one-line notice when the CURRENT capture choice can't run (F11) — never collapses
+    /// the panel; offers the no-driver escape hatch.
+    private var runNotice: String? {
+        guard !controller.canRun else { return nil }
+        switch controller.captureChoice {
+        case .surround:      return "Surround needs the 12-channel driver — switch to Personalized (no driver needed)."
+        case .virtualStereo: return "Virtual device not installed — switch to Personalized (no driver needed)."
+        case .personalized:  return nil
         }
+    }
+
+    private func runNoticeRow(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(text, systemImage: "exclamationmark.triangle")
+                .font(.system(size: 11)).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Use Personalized capture") { controller.setCaptureChoice(.personalized) }
+                .controlSize(.small)
+        }
+    }
+
+    private var permissionNotice: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Audio capture permission needed to route system audio.",
+                  systemImage: "lock.shield")
+                .font(.system(size: 11)).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Open Privacy Settings") { controller.openPrivacySettings() }
+                    .controlSize(.small)
+                Button("Retry") { controller.retryCapture() }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func advisoryRow(_ text: String) -> some View {
+        Label(text, systemImage: "info.circle")
+            .font(.system(size: 10)).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: Footer
 
     private var footer: some View {
         HStack(spacing: 10) {
-            Text("Spatial Audio · personalized binaural")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
-            Spacer()
             Button { openSettings() } label: {
-                Image(systemName: "slider.horizontal.3").font(.system(size: 13))
+                Label("Open Full Controls…", systemImage: "slider.horizontal.3")
+                    .font(.system(size: 12))
             }
-            .buttonStyle(.borderless)
-            .help("Settings — full control surface")
+            .buttonStyle(.link)
+            .help("Open the full control surface")
+            Spacer()
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .controlSize(.small)
         }
@@ -167,15 +215,6 @@ struct PanelView: View {
         openWindow(id: "settings")
     }
 
-    private var driverMissing: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Virtual audio driver not found", systemImage: "exclamationmark.triangle")
-                .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
-            Text("Install the atmos-control HAL driver, then reopen.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-        }
-    }
-
     // MARK: Bindings
 
     /// Binding that mutates config and triggers a graph rebuild when running.
@@ -184,23 +223,24 @@ struct PanelView: View {
                 set: { controller.config[keyPath: kp] = $0; controller.applyConfig() })
     }
 
-    /// Binding for a live Float param (no rebuild), exposed as Double for Slider.
-    private func liveBinding(_ kp: WritableKeyPath<SpatialConfig, Float>, apply: @escaping (Float) -> Void) -> Binding<Double> {
-        Binding(get: { Double(controller.config[keyPath: kp]) }, set: { apply(Float($0)) })
-    }
-
+    /// Strip a leading possessive owner prefix ("Alex's ", "Мария’s ") for any user/device;
+    /// the StatusChip truncates whatever remains with a native tail ellipsis.
     private func shortName(_ s: String) -> String {
-        s.replacingOccurrences(of: "Мария’s ", with: "").replacingOccurrences(of: "MacBook Air ", with: "")
+        for sep in ["’s ", "'s "] {
+            if let r = s.range(of: sep) { return String(s[r.upperBound...]) }
+        }
+        return s
     }
 }
 
 // MARK: - Status chip (icon + label + value; accent only when active, never color-alone)
 
-struct StatusChip: View {
+struct StatusChip<Trailing: View>: View {
     let icon: String
     let label: String
     let value: String
     let active: Bool
+    @ViewBuilder var trailing: () -> Trailing
 
     var body: some View {
         HStack(spacing: 5) {
@@ -212,10 +252,17 @@ struct StatusChip: View {
                 Text(label).font(.system(size: 9)).foregroundStyle(.tertiary)
                 Text(value).font(.system(size: 12, weight: .medium))
                     .foregroundStyle(active ? Color.primary : Color.secondary)
-                    .lineLimit(1)
+                    .lineLimit(1).truncationMode(.tail)
             }
+            trailing()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+extension StatusChip where Trailing == EmptyView {
+    init(icon: String, label: String, value: String, active: Bool) {
+        self.init(icon: icon, label: label, value: value, active: active, trailing: { EmptyView() })
     }
 }
 
