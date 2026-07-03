@@ -9,3 +9,8 @@ DerivedData/
 scratch/
 dist/
 tasks/
+
+# Local-only working docs — kept out of version control (purged from history)
+DESIGN.md
+PRODUCT.md
+NOTES-apple-atmos-render.md
