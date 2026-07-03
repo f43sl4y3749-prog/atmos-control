@@ -494,8 +494,9 @@ static OSStatus AtmosDriver_GetPropertyDataSize(AudioServerPlugInDriverRef      
             case kAudioDevicePropertyIsHidden:            *outDataSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyPreferredChannelsForStereo: *outDataSize = 2 * sizeof(UInt32); return 0;
             case kAudioDevicePropertyPreferredChannelLayout:
-                /* AudioChannelLayout with zero channel descriptions */
-                *outDataSize = (UInt32)offsetof(AudioChannelLayout, mChannelDescriptions[0]);
+                /* AudioChannelLayout with one description per channel */
+                *outDataSize = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions[0])
+                                        + kDevice_ChannelsPerFrame * sizeof(AudioChannelDescription));
                 return 0;
             case kAudioDevicePropertyZeroTimeStampPeriod: *outDataSize = sizeof(UInt32); return 0;
             default: return kAudioHardwareUnknownPropertyError;
@@ -686,12 +687,35 @@ static OSStatus AtmosDriver_GetPropertyData(AudioServerPlugInDriverRef        in
                 return kAudioHardwareNoError;
             }
             case kAudioDevicePropertyPreferredChannelLayout: {
-                UInt32 sz = (UInt32)offsetof(AudioChannelLayout, mChannelDescriptions[0]);
+                /* Descriptions-based 7.1.4 layout (Atmos_7_1_4 channel order).
+                 * The system spatial pipeline (audiomxd / Apple Music) does not
+                 * engage the discrete-multichannel render branch for a tag-only
+                 * layout — it needs explicit channel descriptions, the same shape
+                 * Audio MIDI Setup's "Configure Speakers" writes. */
+                static const AudioChannelLabel kAtmos714Labels[kDevice_ChannelsPerFrame] = {
+                    kAudioChannelLabel_Left,               /* L   */
+                    kAudioChannelLabel_Right,              /* R   */
+                    kAudioChannelLabel_Center,             /* C   */
+                    kAudioChannelLabel_LFEScreen,          /* LFE */
+                    kAudioChannelLabel_LeftSurround,       /* Ls  */
+                    kAudioChannelLabel_RightSurround,      /* Rs  */
+                    kAudioChannelLabel_RearSurroundLeft,   /* Rls */
+                    kAudioChannelLabel_RearSurroundRight,  /* Rrs */
+                    kAudioChannelLabel_VerticalHeightLeft, /* Vhl */
+                    kAudioChannelLabel_VerticalHeightRight,/* Vhr */
+                    kAudioChannelLabel_LeftTopRear,        /* Ltr */
+                    kAudioChannelLabel_RightTopRear        /* Rtr */
+                };
+                UInt32 sz = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions[0])
+                                     + kDevice_ChannelsPerFrame * sizeof(AudioChannelDescription));
                 NEED(sz);
                 AudioChannelLayout *l = (AudioChannelLayout *)outData;
-                l->mChannelLayoutTag          = kAudioChannelLayoutTag_Atmos_7_1_4;
+                memset(l, 0, sz);
+                l->mChannelLayoutTag          = kAudioChannelLayoutTag_UseChannelDescriptions;
                 l->mChannelBitmap             = 0;
-                l->mNumberChannelDescriptions = 0;
+                l->mNumberChannelDescriptions = kDevice_ChannelsPerFrame;
+                for (UInt32 i = 0; i < kDevice_ChannelsPerFrame; i++)
+                    l->mChannelDescriptions[i].mChannelLabel = kAtmos714Labels[i];
                 *outDataSize = sz;
                 return kAudioHardwareNoError;
             }
