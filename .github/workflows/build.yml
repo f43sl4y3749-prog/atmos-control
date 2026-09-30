@@ -22,13 +22,16 @@ jobs:
         run: bash App/build-app.sh release
 
       - name: Build Driver
-        run: bash Driver/build.sh
+        run: |
+          export CODE_SIGNING_ALLOWED=NO
+          export CODE_SIGN_FLAGS="--deep --force --sign -"
+          bash Driver/build.sh
 
-      - name: Package Deliverables
+      - name: Prepare Deliverables
         run: |
           mkdir -p build-output
-          cp -R dist/atmos-control.app build-output/ 2>/dev/null || true
-          cp -R Driver/.build/atmos-control.driver build-output/ 2>/dev/null || true
+          [ -d "dist/atmos-control.app" ] && cp -R dist/atmos-control.app build-output/
+          find . -name "*.driver" -exec cp -R {} build-output/ \;
 
       - name: Upload Bundle Artifact
         uses: actions/upload-artifact@v4
