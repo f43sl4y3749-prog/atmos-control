@@ -1,0 +1,21 @@
+name: Build atmos-control App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build App
+        run: |
+          bash App/build-app.sh release
+
+      - name: Upload App Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atmos-control-app
+          path: dist/atmos-control.app
