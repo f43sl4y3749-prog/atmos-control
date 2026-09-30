@@ -10,20 +10,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
-      - name: Build App and Driver
+      - name: Setup Xcode
         run: |
-          chmod +x App/build-app.sh
-          bash App/build-app.sh release
-          chmod +x Driver/build.sh
-          bash Driver/build.sh
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          sudo xcodebuild -license accept
 
-      - name: Upload Bundle
+      - name: Make Scripts Executable
+        run: chmod -R +x .
+
+      - name: Build App
+        run: bash App/build-app.sh release
+
+      - name: Build Driver
+        run: bash Driver/build.sh
+
+      - name: Package Deliverables
+        run: |
+          mkdir -p build-output
+          cp -R dist/atmos-control.app build-output/ 2>/dev/null || true
+          cp -R Driver/.build/atmos-control.driver build-output/ 2>/dev/null || true
+
+      - name: Upload Bundle Artifact
         uses: actions/upload-artifact@v4
         with:
           name: atmos-control-bundle
-          path: |
-            dist/atmos-control.app
-            Driver/.build/atmos-control.driver
+          path: build-output/
