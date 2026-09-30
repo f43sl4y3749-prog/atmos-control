@@ -1,21 +1,29 @@
-name: Build atmos-control App
+name: Build App and Driver
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build App
-        run: |
-          bash App/build-app.sh release
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
-      - name: Upload App Artifact
+      - name: Build App and Driver
+        run: |
+          chmod +x App/build-app.sh
+          bash App/build-app.sh release
+          chmod +x Driver/build.sh
+          bash Driver/build.sh
+
+      - name: Upload Bundle
         uses: actions/upload-artifact@v4
         with:
-          name: atmos-control-app
-          path: dist/atmos-control.app
+          name: atmos-control-bundle
+          path: |
+            dist/atmos-control.app
+            Driver/.build/atmos-control.driver
